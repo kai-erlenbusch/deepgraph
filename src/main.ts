@@ -1,108 +1,150 @@
 import * as THREE from 'three';
+import { MeshBasicNodeMaterial } from 'three/webgpu';
+import { 
+  attribute, float, positionLocal, vec3, vec2, uv, distance, smoothstep,
+  fwidth, hash, instanceIndex, Discard, max
+} from 'three/tsl';
 import { Renderer } from './core/Renderer';
-import { TileManager, BoundingBox } from './data/TileManager';
-import { Table } from 'apache-arrow';
+import { TileManager, BoundingBox, TileData } from './data/TileManager';
 
 const TILE_SERVER_URL = '/data';
 
 class Scatterplot {
   private scene: THREE.Scene;
-  private pointsMaterial: THREE.PointsMaterial;
-  private tileMeshes: Map<Table, THREE.Points> = new Map();
+  private material: MeshBasicNodeMaterial;
+  private tileMeshes: Map<string, THREE.Mesh> = new Map();
+  private quadGeometry = new THREE.PlaneGeometry(1, 1);
 
-  constructor(scene: THREE.Scene) {
+  private pickingScene: THREE.Scene;
+  private pickingMaterial: MeshBasicNodeMaterial;
+  private pickingMeshes: Map<string, THREE.Mesh> = new Map();
+  private globalPickingId = 0;
+  public pickingMap: Map<number, { tileKey: string, rowIndex: number }> = new Map();
+
+  constructor(scene: THREE.Scene, rendererWrapper: Renderer) {
     this.scene = scene;
-    this.pointsMaterial = new THREE.PointsMaterial({
-      size: 2,
-      sizeAttenuation: false,
-      color: 0xffffff, // White base to let vertex colors show through
-      vertexColors: true, // Enable per-point coloring
+    
+    this.material = new MeshBasicNodeMaterial({
       transparent: true,
-      opacity: 0.8
+      depthWrite: false,
+      blending: THREE.CustomBlending,
+      blendSrc: THREE.OneFactor, // Pre-multiplying in shader
+      blendDst: THREE.OneMinusSrcAlphaFactor,
+      blendEquation: THREE.AddEquation,
     });
+
+    // Dynamic quad scaling locked to exact microscopic physical pixels
+    // Deepscatter typically uses 1.2 - 1.4 pixels for these massive datasets
+    const targetPixels = float(1.4); 
+    const size = targetPixels.mul(rendererWrapper.worldUnitsPerPixelUniform);
+    
+    // Calculate distance from the quad's center (0.5, 0.5)
+    const dist = distance(uv(), vec2(0.5));
+    
+    // Mathematically perfect 1-pixel anti-aliasing via hardware derivatives
+    const delta = fwidth(dist);
+    const alphaEdge = smoothstep(float(0.5).add(delta), float(0.5).sub(delta), dist);
+    
+    // Density-Targeted Alpha (Low opacity for deep blending accumulation)
+    const baseOpacity = float(0.04); 
+    const finalAlpha = alphaEdge.mul(baseOpacity);
+
+    // Stochastic Sub-pixel Dithering (The Secret Weapon)
+    const threshold = float(1.0 / 255.0);
+    const randomVal = hash(instanceIndex);
+    const isSubPixelOpacity = finalAlpha.lessThan(threshold);
+    const probDiscard = randomVal.greaterThan(finalAlpha.mul(255.0));
+    
+    // Discard entire instances probabilistically if they fall below monitor capabilities
+    Discard(isSubPixelOpacity.and(probDiscard));
+    
+    // If it survives the discard, ensure it acts as at least 1/255 opacity
+    const safeAlpha = max(finalAlpha, threshold);
+    
+    // Pre-multiply color by alpha before outputting to blending hardware
+    const baseColor = attribute('instanceColor', 'vec3');
+    this.material.colorNode = baseColor.mul(safeAlpha);
+    this.material.opacityNode = safeAlpha;
+    
+    // World position: instance offset + local vertex position * size
+    this.material.positionNode = attribute('offset', 'vec3').add(positionLocal.mul(size));
+
+    // Picking Setup
+    this.pickingScene = new THREE.Scene();
+    this.pickingScene.background = new THREE.Color(0x000000); // 0 is null id
+    this.pickingMaterial = new MeshBasicNodeMaterial({
+      depthWrite: false,
+      blending: THREE.NoBlending,
+    });
+    this.pickingMaterial.colorNode = attribute('pickingColor', 'vec3');
+    this.pickingMaterial.positionNode = this.material.positionNode;
   }
 
-  public updateTiles(tables: Table[]) {
-    // Determine which tables are no longer needed
-    const currentTables = new Set(tables);
-    for (const [table, mesh] of this.tileMeshes.entries()) {
-      if (!currentTables.has(table)) {
+  public updateTiles(tiles: TileData[]) {
+    // Determine which tiles are no longer needed
+    const currentKeys = new Set(tiles.map(t => t.key));
+    for (const [key, mesh] of this.tileMeshes.entries()) {
+      if (!currentKeys.has(key)) {
         this.scene.remove(mesh);
         mesh.geometry.dispose();
-        this.tileMeshes.delete(table);
+        this.tileMeshes.delete(key);
+        
+        const pickingMesh = this.pickingMeshes.get(key);
+        if (pickingMesh) {
+          this.pickingScene.remove(pickingMesh);
+          this.pickingMeshes.delete(key);
+        }
       }
     }
 
-    // Add new tables
-    for (const table of tables) {
-      if (!this.tileMeshes.has(table)) {
-        this.addTile(table);
+    // Add new tiles
+    for (const tile of tiles) {
+      if (!this.tileMeshes.has(tile.key)) {
+        this.addTile(tile);
       }
     }
   }
 
-  private addTile(table: Table) {
-    const numRows = table.numRows;
+  private addTile(tile: TileData) {
+    const instancedGeometry = new THREE.InstancedBufferGeometry();
+    instancedGeometry.index = this.quadGeometry.index;
+    instancedGeometry.instanceCount = tile.numRows;
+    instancedGeometry.attributes.position = this.quadGeometry.attributes.position;
+    instancedGeometry.attributes.uv = this.quadGeometry.attributes.uv;
+
+    instancedGeometry.setAttribute('offset', new THREE.InstancedBufferAttribute(tile.positions, 3));
+    instancedGeometry.setAttribute('instanceColor', new THREE.InstancedBufferAttribute(tile.colors, 3));
+
+    const sizes = new Float32Array(tile.numRows);
+    for (let i = 0; i < tile.numRows; i++) {
+      sizes[i] = 0.5 + Math.random() * 2.0; 
+    }
+    instancedGeometry.setAttribute('instanceSize', new THREE.InstancedBufferAttribute(sizes, 1));
+
+    const pickingColors = new Float32Array(tile.numRows * 3);
+    for (let i = 0; i < tile.numRows; i++) {
+      const id = ++this.globalPickingId; // starts at 1
+      this.pickingMap.set(id, { tileKey: tile.key, rowIndex: i });
+      pickingColors[i * 3 + 0] = ((id >> 16) & 255) / 255;
+      pickingColors[i * 3 + 1] = ((id >> 8) & 255) / 255;
+      pickingColors[i * 3 + 2] = (id & 255) / 255;
+    }
+    instancedGeometry.setAttribute('pickingColor', new THREE.InstancedBufferAttribute(pickingColors, 3));
+
+    const mesh = new THREE.Mesh(instancedGeometry, this.material);
+    mesh.frustumCulled = false; // We handle culling manually via TileManager
     
+    this.scene.add(mesh);
+    this.tileMeshes.set(tile.key, mesh);
 
-    // Use vector access directly to avoid toArray() crashes on some types
-    const xCol = table.getChild('x');
-    const yCol = table.getChild('y');
+    const pickingMesh = new THREE.Mesh(instancedGeometry, this.pickingMaterial);
+    pickingMesh.frustumCulled = false;
+    this.pickingScene.add(pickingMesh);
+    this.pickingMeshes.set(tile.key, pickingMesh);
+  }
 
-    if (!xCol || !yCol) {
-      console.warn('Table is missing x or y columns');
-      return;
-    }
-
-    // Create interleaved or separated position buffer
-    const positions = new Float32Array(numRows * 3);
-    for (let i = 0; i < numRows; i++) {
-      positions[i * 3 + 0] = xCol.get(i) as number;
-      positions[i * 3 + 1] = yCol.get(i) as number;
-      positions[i * 3 + 2] = 0; // z is 0
-    }
-
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-
-    // Generate colors from model_id
-    const modelIdCol = table.getChild('model_id');
-    if (modelIdCol) {
-      const colors = new Float32Array(numRows * 3);
-      
-      // Categorical palette
-      const palette = [
-        [0.2, 0.6, 1.0], // gpt-4 (Blue)
-        [1.0, 0.4, 0.2], // claude-3 (Orange)
-        [0.4, 0.8, 0.4], // gemini-1.5 (Green)
-        [0.8, 0.2, 0.6], // llama-3 (Pink)
-        [0.9, 0.8, 0.2]  // mixtral (Yellow)
-      ];
-      
-      for (let i = 0; i < numRows; i++) {
-        // modelIdCol might be a string or a dictionary. 
-        // We'll just hash the string or grab its length to assign a deterministic color
-        const val = modelIdCol.get(i);
-        let id = 0;
-        if (typeof val === 'string') {
-          id = val.length % 5; // Hacky hash just to visualize different models
-        } else if (typeof val === 'number') {
-          id = Math.abs(Math.floor(val)) % 5;
-        }
-
-        const c = palette[id];
-        colors[i * 3 + 0] = c[0];
-        colors[i * 3 + 1] = c[1];
-        colors[i * 3 + 2] = c[2];
-      }
-      geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    }
-
-    const points = new THREE.Points(geometry, this.pointsMaterial);
-    points.frustumCulled = false; // We handle culling manually via TileManager
-    
-    this.scene.add(points);
-    this.tileMeshes.set(table, points);
+  public getPickingScene() {
+    return this.pickingScene;
   }
 }
 
@@ -129,7 +171,34 @@ async function init() {
   
   uiText.innerHTML = `WebGPU is supported!<br/>Streaming Quadtree Tiles...`;
 
-  const scatterplot = new Scatterplot(rendererWrapper.scene);
+  const scatterplot = new Scatterplot(rendererWrapper.scene, rendererWrapper);
+
+  const pickingTexture = new THREE.RenderTarget(window.innerWidth, window.innerHeight, {
+    colorSpace: THREE.NoColorSpace
+  });
+  window.addEventListener('resize', () => {
+    pickingTexture.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  const mouse = new THREE.Vector2();
+  let mouseMoved = false;
+
+  window.addEventListener('mousemove', (e) => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+    mouseMoved = true;
+  });
+
+  const tooltip = document.createElement('div');
+  tooltip.style.position = 'absolute';
+  tooltip.style.background = 'rgba(0,0,0,0.8)';
+  tooltip.style.color = 'white';
+  tooltip.style.padding = '5px';
+  tooltip.style.borderRadius = '5px';
+  tooltip.style.display = 'none';
+  tooltip.style.pointerEvents = 'none';
+  tooltip.style.zIndex = '1000';
+  document.body.appendChild(tooltip);
 
   let lastBoundsString = "";
 
@@ -140,17 +209,42 @@ async function init() {
       const zoomLevel = Math.max(0, Math.floor(Math.log2(rendererWrapper.camera.zoom)));
       
       // 2. Fetch visible tiles
-      const visibleTables = await tileManager.getVisibleTiles(bounds, zoomLevel);
+      const visibleTiles = await tileManager.getVisibleTiles(bounds, zoomLevel);
       
       // 3. Update scatterplot geometry
-      scatterplot.updateTiles(visibleTables);
+      scatterplot.updateTiles(visibleTiles);
       
       let totalPoints = 0;
-      for (const t of visibleTables) totalPoints += t.numRows;
-      uiText.innerHTML = `Streaming Quadtree<br/>Tiles rendered: ${visibleTables.length}<br/>Points: ${totalPoints}<br/>Zoom Level: ${zoomLevel}`;
+      for (const t of visibleTiles) totalPoints += t.numRows;
+      uiText.innerHTML = `Streaming Quadtree<br/>Tiles rendered: ${visibleTiles.length}<br/>Points: ${totalPoints}<br/>Zoom Level: ${zoomLevel}`;
 
       // 4. Render
       rendererWrapper.render();
+
+      // 5. Picking Pass
+      if (mouseMoved) {
+        mouseMoved = false;
+        
+        rendererWrapper.renderer.setRenderTarget(pickingTexture);
+        rendererWrapper.renderer.render(scatterplot.getPickingScene(), rendererWrapper.camera);
+        rendererWrapper.renderer.setRenderTarget(null);
+        
+        // readRenderTargetPixelsAsync coordinates are usually bottom-left origin
+        const pickY = window.innerHeight - mouse.y;
+        const pixelBuffer = await rendererWrapper.renderer.readRenderTargetPixelsAsync(pickingTexture, mouse.x, pickY, 1, 1);
+        
+        const id = (pixelBuffer[0] << 16) | (pixelBuffer[1] << 8) | pixelBuffer[2];
+        if (id > 0 && scatterplot.pickingMap.has(id)) {
+          const data = scatterplot.pickingMap.get(id)!;
+          tooltip.style.display = 'block';
+          tooltip.style.left = mouse.x + 15 + 'px';
+          tooltip.style.top = mouse.y + 15 + 'px';
+          tooltip.style.fontFamily = 'monospace';
+          tooltip.innerHTML = `Tile: ${data.tileKey}<br/>Row: ${data.rowIndex}<br/>Global ID: ${id}`;
+        } else {
+          tooltip.style.display = 'none';
+        }
+      }
     } catch (err) {
       console.error("Animation loop crash:", err);
       rendererWrapper.renderer.setAnimationLoop(null); // Stop loop to avoid 3000 errors

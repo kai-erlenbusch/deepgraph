@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
+import { uniform } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 export class Renderer {
@@ -7,6 +8,9 @@ export class Renderer {
   public scene: THREE.Scene;
   public camera: THREE.OrthographicCamera;
   public controls: OrbitControls;
+  public zoomUniform = uniform(1.0);
+  public dprUniform = uniform(window.devicePixelRatio);
+  public worldUnitsPerPixelUniform = uniform(40 / window.innerHeight);
 
   constructor(container: HTMLElement) {
     this.renderer = new WebGPURenderer({ antialias: true });
@@ -71,6 +75,9 @@ export class Renderer {
 
   public render() {
     this.controls.update();
+    this.zoomUniform.value = this.camera.zoom;
+    this.dprUniform.value = window.devicePixelRatio;
+    this.worldUnitsPerPixelUniform.value = 40 / (window.innerHeight * this.camera.zoom);
     this.renderer.render(this.scene, this.camera);
   }
 

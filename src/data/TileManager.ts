@@ -1,5 +1,3 @@
-import { tableFromIPC, Table } from 'apache-arrow';
-
 export interface BoundingBox {
   minX: number;
   minY: number;
@@ -7,13 +5,20 @@ export interface BoundingBox {
   maxY: number;
 }
 
+export interface TileData {
+  key: string;
+  positions: Float32Array;
+  colors: Float32Array;
+  numRows: number;
+}
+
 export class TileNode {
   z: number;
   x: number;
   y: number;
   bounds: BoundingBox;
-  table: Table | null = null;
-  loading: boolean = false;
+  tileData: TileData | null = null;
+  lastAccessFrame: number = 0;
   children: TileNode[] | null = null;
 
   constructor(z: number, x: number, y: number, bounds: BoundingBox) {
@@ -37,14 +42,36 @@ export class TileNode {
 export class TileManager {
   private baseUrl: string;
   public root: TileNode | null = null;
-  public activeTables: Table[] = [];
+  public activeTiles: TileData[] = [];
   
   // Track fetching to avoid duplicate requests
-  private fetchCache: Map<string, Promise<Table | null>> = new Map();
+  private fetchCache: Map<string, Promise<TileData | null>> = new Map();
+  private pendingRequests: Map<string, (data: TileData | null) => void> = new Map();
+  private worker: Worker;
+
+  // LRU Cache tracking
+  private currentFrame = 0;
+  public maxCacheSize = 50; // Maximum number of loaded tiles in memory
 
   constructor(baseUrl: string, rootBounds: BoundingBox = { minX: 0, minY: 0, maxX: 100, maxY: 100 }) {
     this.baseUrl = baseUrl;
     this.root = new TileNode(0, 0, 0, rootBounds);
+
+    // Initialize Web Worker
+    this.worker = new Worker(new URL('./ArrowWorker.ts', import.meta.url), { type: 'module' });
+    this.worker.onmessage = (e) => {
+      const { key, positions, colors, numRows, error } = e.data;
+      const resolve = this.pendingRequests.get(key);
+      if (resolve) {
+        if (error || !positions) {
+          if (error !== '404') console.warn(`Worker error for ${key}:`, error);
+          resolve(null);
+        } else {
+          resolve({ key, positions, colors, numRows });
+        }
+        this.pendingRequests.delete(key);
+      }
+    };
   }
 
   public async init() {
@@ -55,76 +82,103 @@ export class TileManager {
     return `${this.baseUrl}/${z}/${x}/${y}.feather`;
   }
 
-  public async loadTile(node: TileNode): Promise<Table | null> {
+  public async loadTile(node: TileNode): Promise<TileData | null> {
     const key = `${node.z}/${node.x}/${node.y}`;
     if (this.fetchCache.has(key)) {
       return this.fetchCache.get(key)!;
     }
 
-    const promise = (async () => {
-      try {
-        const url = this.getTileUrl(node.z, node.x, node.y);
-        const response = await fetch(url, { cache: 'no-cache' });
-        if (!response.ok) {
-          // Normal for non-existent children
-          return null;
-        }
-        const buffer = await response.arrayBuffer();
-        const table = tableFromIPC(buffer);
-        node.table = table;
-        console.log(`Loaded tile ${key} with ${table.numRows} rows.`);
-        return table;
-      } catch (e) {
-        console.warn(`Failed to fetch tile ${key}:`, e);
-        return null;
+    const promise = new Promise<TileData | null>((resolve) => {
+      this.pendingRequests.set(key, resolve);
+      this.worker.postMessage({ url: this.getTileUrl(node.z, node.x, node.y), key });
+    }).then(data => {
+      node.tileData = data;
+      if (data) {
+        console.log(`Loaded tile ${key} with ${data.numRows} rows via Worker.`);
       }
-    })();
+      return data;
+    });
 
     this.fetchCache.set(key, promise);
     return promise;
   }
 
   // Traverse the quadtree and collect tiles that should be rendered
-  // Returns an array of Arrow Tables
-  public async getVisibleTiles(viewport: BoundingBox, maxZoom: number): Promise<Table[]> {
+  // Returns an array of TileData
+  public async getVisibleTiles(viewport: BoundingBox, maxZoom: number): Promise<TileData[]> {
+    this.currentFrame++;
     if (!this.root) return [];
     
-    const visibleTables: Table[] = [];
+    const visibleTiles: TileData[] = [];
     const queue: TileNode[] = [this.root];
 
     while (queue.length > 0) {
       const node = queue.shift()!;
-      // console.log(`Checking intersection for node ${node.z}/${node.x}/${node.y} bounds:`, node.bounds, `against viewport:`, viewport);
 
       if (!node.intersects(viewport)) {
-        // console.log(`Node ${node.z}/${node.x}/${node.y} DOES NOT intersect viewport`);
         continue;
       }
-      
-      // console.log(`Node ${node.z}/${node.x}/${node.y} INTERSECTS viewport`);
 
       // If we don't have the table yet, start loading it
-      if (!node.table && !this.fetchCache.has(`${node.z}/${node.x}/${node.y}`)) {
-        console.log(`Starting load for ${node.z}/${node.x}/${node.y}`);
-        this.loadTile(node); // Background load
+      if (!node.tileData && !this.fetchCache.has(`${node.z}/${node.x}/${node.y}`)) {
+        console.log(`Starting background load for ${node.z}/${node.x}/${node.y}`);
+        this.loadTile(node); 
       }
 
       // If we have data, we can render this tile's base points
-      if (node.table) {
-        visibleTables.push(node.table);
-      }
-
-      // If we are below maxZoom, we should traverse children
-      if (node.z < maxZoom) {
-        if (!node.children) {
-          this.createChildren(node);
+      if (node.tileData) {
+        node.lastAccessFrame = this.currentFrame;
+        visibleTiles.push(node.tileData);
+        
+        // Only traverse to children if this node actually exists and has data.
+        if (node.z < maxZoom) {
+          if (!node.children) {
+            this.createChildren(node);
+          }
+          queue.push(...node.children!);
         }
-        queue.push(...node.children!);
       }
     }
 
-    this.activeTables = visibleTables;
-    return visibleTables;
+    this.activeTiles = visibleTiles;
+    this.evictStaleTiles();
+    return visibleTiles;
+  }
+
+  private evictStaleTiles() {
+    // We count how many nodes actually have tileData
+    let loadedCount = 0;
+    const loadedNodes: TileNode[] = [];
+    
+    const traverse = (n: TileNode) => {
+      if (n.tileData) {
+        loadedCount++;
+        loadedNodes.push(n);
+      }
+      if (n.children) n.children.forEach(traverse);
+    };
+    
+    if (this.root) traverse(this.root);
+
+    if (loadedCount <= this.maxCacheSize) return;
+
+    // Sort by oldest access frame first
+    loadedNodes.sort((a, b) => a.lastAccessFrame - b.lastAccessFrame);
+    
+    const excess = loadedCount - this.maxCacheSize;
+    let evicted = 0;
+    
+    for (const node of loadedNodes) {
+      if (evicted >= excess) break;
+      // Never evict tiles that were accessed THIS frame
+      if (node.lastAccessFrame === this.currentFrame) continue;
+      
+      const key = `${node.z}/${node.x}/${node.y}`;
+      this.fetchCache.delete(key);
+      node.tileData = null; // Drop reference so garbage collector can clean up
+      evicted++;
+      console.log(`Evicted tile ${key} from LRU Cache`);
+    }
   }
 
   private createChildren(node: TileNode) {
