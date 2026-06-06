@@ -94,26 +94,13 @@ export class Renderer {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
   }
 
-  public getViewportBounds() {
-    // Calculate the physical size of the focal plane in World Units
-    const dist = this.camera.position.distanceTo(this.controls.target);
-    const fovRad = THREE.MathUtils.degToRad(this.camera.fov);
-    const visibleHeight = 2 * Math.tan(fovRad / 2) * dist;
-    const visibleWidth = visibleHeight * this.camera.aspect;
-    
-    // When the camera tilts, a pure top-down box isn't enough. 
-    // We multiply the bounds by a "Tilt Buffer" (e.g., 2.0) to fetch extra tiles 
-    // so the horizon doesn't disappear when looking forward!
-    const tiltBuffer = 2.0; 
-    const halfW = (visibleWidth / 2) * tiltBuffer;
-    const halfH = (visibleHeight / 2) * tiltBuffer;
-    
-    return {
-      minX: this.controls.target.x - halfW,
-      maxX: this.controls.target.x + halfW,
-      minY: this.controls.target.y - halfH,
-      maxY: this.controls.target.y + halfH
-    };
+  public getFrustum(): THREE.Frustum {
+    const frustum = new THREE.Frustum();
+    const projScreenMatrix = new THREE.Matrix4();
+    this.camera.updateMatrixWorld();
+    projScreenMatrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projScreenMatrix);
+    return frustum;
   }
 
   public render() {

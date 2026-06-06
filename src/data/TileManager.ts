@@ -1,3 +1,5 @@
+import * as THREE from 'three';
+
 export interface BoundingBox {
   minX: number;
   minY: number;
@@ -16,6 +18,7 @@ export class TileNode {
   x: number;
   y: number;
   bounds: BoundingBox;
+  box3: THREE.Box3;
   tileData: TileData | null = null;
   lastAccessFrame: number = 0;
   children: TileNode[] | null = null;
@@ -25,16 +28,15 @@ export class TileNode {
     this.x = x;
     this.y = y;
     this.bounds = bounds;
+    this.box3 = new THREE.Box3(
+      new THREE.Vector3(bounds.minX, bounds.minY, -1000),
+      new THREE.Vector3(bounds.maxX, bounds.maxY, 1000)
+    );
   }
 
   // Check if this tile intersects with the camera viewport
-  intersects(viewport: BoundingBox): boolean {
-    return !(
-      viewport.maxX < this.bounds.minX ||
-      viewport.minX > this.bounds.maxX ||
-      viewport.maxY < this.bounds.minY ||
-      viewport.minY > this.bounds.maxY
-    );
+  intersects(frustum: THREE.Frustum): boolean {
+    return frustum.intersectsBox(this.box3);
   }
 }
 
@@ -104,7 +106,7 @@ export class TileManager {
 
   // Traverse the quadtree and collect tiles that should be rendered
   // Returns an array of TileData
-  public async getVisibleTiles(viewport: BoundingBox, maxZoom: number): Promise<TileData[]> {
+  public async getVisibleTiles(frustum: THREE.Frustum, maxZoom: number): Promise<TileData[]> {
     this.currentFrame++;
     if (!this.root) return [];
     
@@ -114,7 +116,7 @@ export class TileManager {
     while (queue.length > 0) {
       const node = queue.shift()!;
 
-      if (!node.intersects(viewport)) {
+      if (!node.intersects(frustum)) {
         continue;
       }
 
@@ -127,14 +129,23 @@ export class TileManager {
       // If we have data, we can render this tile's base points
       if (node.tileData) {
         node.lastAccessFrame = this.currentFrame;
-        visibleTiles.push(node.tileData);
         
-        // Only traverse to children if this node actually exists and has data.
+        let allIntersectingChildrenLoaded = false;
         if (node.z < maxZoom) {
           if (!node.children) {
             this.createChildren(node);
           }
-          queue.push(...node.children!);
+          
+          const intersectingChildren = node.children!.filter(c => c.intersects(frustum));
+          if (intersectingChildren.length > 0) {
+            allIntersectingChildrenLoaded = intersectingChildren.every(c => c.tileData !== null);
+            queue.push(...intersectingChildren);
+          }
+        }
+        
+        // Prevent LOD Overdraw: Only render parent if children aren't fully ready
+        if (!allIntersectingChildrenLoaded) {
+          visibleTiles.push(node.tileData);
         }
       }
     }

@@ -368,12 +368,12 @@ async function init() {
 
   rendererWrapper.renderer.setAnimationLoop(async () => {
     try {
-      // 1. Get viewport bounds
-      const bounds = rendererWrapper.getViewportBounds();
-      const zoomLevel = Math.max(0, Math.floor(Math.log2(rendererWrapper.camera.zoom)));
+      // 1. Get frustum
+      const frustum = rendererWrapper.getFrustum();
+      const zoomLevel = Math.max(0, Math.floor(Math.log2(rendererWrapper.zoomUniform.value)));
       
       // 2. Fetch visible tiles
-      const visibleTiles = await tileManager.getVisibleTiles(bounds, zoomLevel);
+      const visibleTiles = await tileManager.getVisibleTiles(frustum, zoomLevel);
       
       // 3. Update scatterplot geometry
       scatterplot.updateTiles(visibleTiles);
@@ -393,13 +393,18 @@ async function init() {
       if (mouseMoved) {
         mouseMoved = false;
         
+        // Fix Picking Pass: Render only the 1x1 pixel under the mouse
+        rendererWrapper.camera.setViewOffset(window.innerWidth, window.innerHeight, mouse.x, mouse.y, 1, 1);
+        
         rendererWrapper.renderer.setRenderTarget(pickingTexture);
         rendererWrapper.renderer.render(scatterplot.getPickingScene(), rendererWrapper.camera);
         rendererWrapper.renderer.setRenderTarget(null);
         
+        rendererWrapper.camera.clearViewOffset();
+        
         // WebGPU render targets use a Top-Left origin (0,0 is top-left), exactly matching the mouse!
-        const pickY = mouse.y;
-        const pixelBuffer = await rendererWrapper.renderer.readRenderTargetPixelsAsync(pickingTexture, mouse.x, pickY, 1, 1);
+        // Read from 0,0 since we only rendered a 1x1 texture
+        const pixelBuffer = await rendererWrapper.renderer.readRenderTargetPixelsAsync(pickingTexture, 0, 0, 1, 1);
         
         const id = (pixelBuffer[0] << 16) | (pixelBuffer[1] << 8) | pixelBuffer[2];
         if (id > 0 && scatterplot.pickingMap.has(id)) {

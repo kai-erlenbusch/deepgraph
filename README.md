@@ -1,24 +1,21 @@
 # Deepgraph WebGPU 🌌
 
-Deepgraph is a high-performance, WebGPU-accelerated point cloud and scatterplot rendering engine designed for massive datasets. Inspired by architectures like Nomic Deepscatter and the PubMed Landscape, Deepgraph uses cutting-edge hardware-accelerated shaders and streaming binary formats to render hundreds of thousands of data points at 60 FPS directly in the browser.
+Deepgraph is a high-performance, WebGPU-accelerated static embedding engine designed for massive point cloud datasets. Acting as the parallel 2D/2.5D counterpart to the `deepgraph-3d` DuckDB engine, this repository leverages modern browser hardware to render millions of data points at 60 FPS using an out-of-core Apache Arrow streaming pipeline.
 
-## 🚀 Features
+## 🚀 Key Features
 
-- **WebGPU Powered:** Built on the cutting-edge Three.js Shading Language (TSL) and WebGPU backend, offloading all calculation and blending math directly to the GPU.
-- **Hardware-level Anti-Aliasing:** Utilizes GPU hardware derivatives (`fwidth`) to guarantee perfect 1-pixel soft edges regardless of zoom level, entirely eliminating pixelation and blockiness.
-- **Deepscatter Architecture ("North Star"):** 
-  - **Pre-multiplied Alpha Blending:** Prevents massive point clusters from blowing out to pure white.
-  - **Microscopic Point Sizing:** Dynamically locks point sizes to exact physical screen pixels (e.g. 1.4px).
-  - **Stochastic Sub-pixel Dithering:** Employs TSL `hash()` and probabilistic `Discard` to simulate sub-8-bit opacities, allowing you to perfectly resolve delicate topological "cracks" and voids in dense UMAP embeddings.
-- **Quadtree Streaming:** Engineered to stream and decode Apache Arrow binary files over the network asynchronously using Web Workers.
-- **Interactive Spatial Indexing:** Uses bounding boxes and quadtree logic to only load and render tiles that intersect with the current camera view.
+### The WebGPU TSL Pipeline
+- **Hardware-level Anti-Aliasing (`fwidth`):** Guarantees perfectly smooth 1-pixel soft edges regardless of zoom level, entirely eliminating pixelation.
+- **Stochastic Sub-Pixel Dithering:** Employs TSL `hash()` and probabilistic `Discard` to simulate sub-8-bit opacities, allowing delicate topological clusters to be rendered without "brightness blowout".
+- **Pre-multiplied Alpha Blending:** Maps density mathematically to avoid standard Z-sorting bottlenecks.
 
-## 🛠️ Technology Stack
+### Advanced 2.5D Interaction
+- **True Frustum Culling:** Implements mathematically precise `THREE.Frustum` intersections against an infinitely tall `THREE.Box3`. The camera can be seamlessly tilted into a 2.5D extruded view without horizon tiles randomly disappearing.
+- **Micro-Picking (1x1 Offset Pass):** Hover tooltips use an optimized camera `setViewOffset` to render exactly one pixel per frame, protecting the 60 FPS target regardless of dataset size.
 
-- **Framework:** Vite + TypeScript
-- **Rendering:** Three.js (`three/webgpu` + `three/tsl`)
-- **Data Format:** Apache Arrow (IPC format)
-- **Concurrency:** Dedicated Web Workers for off-main-thread Arrow decoding
+### Zero-Copy Data Streaming
+- **Apache Arrow Interleaving:** Dedicated Web Workers fetch and decode columnar binary data, streaming raw `Float32Array` vectors directly into GPU buffers.
+- **LOD Overdraw Prevention:** The Quadtree `TileManager` calculates dynamic Level of Detail (LOD), guaranteeing seamless visual transitions by strictly hiding parent tiles the moment their higher-resolution children are fully loaded into VRAM.
 
 ## 💻 Local Development
 
@@ -43,7 +40,7 @@ Deepgraph is a high-performance, WebGPU-accelerated point cloud and scatterplot 
    ```bash
    npm run dev
    ```
-   The application will be available at `http://localhost:5173`.
+   The application will run the optimized Vite pipeline at `http://localhost:5178`.
 
 ### Building for Production
 ```bash
@@ -53,10 +50,10 @@ npm run build
 ## 🗺️ Architecture Overview
 Deepgraph is split into a modular, multi-threaded pipeline:
 
-1. **`Renderer.ts`:** Manages the WebGPU context, orthographic camera scaling, and continuous render loops. It broadcasts real-time physical screen metrics (Device Pixel Ratio, World-Units-per-Pixel) to the shaders.
-2. **`TileManager.ts`:** Handles the spatial Quadtree indexing. It detects when the camera pan/zooms into new bounding box territories and requests raw Arrow binary data.
-3. **`ArrowWorker.ts`:** A dedicated Web Worker that parses the Apache Arrow binary files from the network and extracts them into typed `Float32Array` buffers (Positions, Colors, etc.) to prevent main-thread UI stalling.
-4. **`main.ts` (TSL Engine):** The heart of the visualization. An `InstancedMesh` with a `MeshBasicNodeMaterial` entirely rewritten in Three.js Shading Language to handle custom Pre-multiplied Blending, fwidth derivatives, and stochastic sub-pixel dithering.
+1. **`main.ts` (TSL Engine):** The heart of the visualization. An `InstancedMesh` with a `MeshBasicNodeMaterial` rewritten entirely in Three.js Shading Language to handle custom Pre-multiplied Blending, fwidth derivatives, and stochastic sub-pixel dithering.
+2. **`Renderer.ts`:** Manages the WebGPU context, continuous render loops, and 2D/2.5D camera orbital mechanics. It broadcasts real-time physical screen metrics (Device Pixel Ratio, World-Units-per-Pixel) to the shaders.
+3. **`TileManager.ts`:** Handles the spatial Quadtree indexing and Frustum intersection logic. It strictly manages the GPU cache through an LRU eviction policy.
+4. **`ArrowWorker.ts`:** A dedicated Web Worker that parses the Apache Arrow binary files from the network, mapping vectors into WebGPU-ready 16-byte interleaved buffers to prevent main-thread UI stalling.
 
 ## 📄 License
 MIT License
