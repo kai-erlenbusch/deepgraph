@@ -35,6 +35,25 @@ const paletteUniform = uniformArray(activePalette);
   }
 };
 
+let is2DMode = false;
+let rendererInstance: Renderer | null = null;
+let scatterplotInstance: Scatterplot | null = null;
+
+(window as any).swapMode = () => {
+  is2DMode = !is2DMode;
+  if (scatterplotInstance) {
+    // 0.0 perfectly flattens the points. 2.0 extrudes them.
+    scatterplotInstance.layerSpacingUniform.value = is2DMode ? 0.0 : 2.0;
+  }
+  if (rendererInstance) {
+    rendererInstance.set2DMode(is2DMode);
+  }
+  
+  const btn = document.getElementById('swap-mode-btn');
+  if (btn) {
+    btn.innerText = `Mode: ${is2DMode ? '2D' : '2.5D'}`;
+  }
+};
 
 class Scatterplot {
   private scene: THREE.Scene;
@@ -50,6 +69,7 @@ class Scatterplot {
   
   public hoverMesh: THREE.Mesh;
   public hoverColorUniform: any;
+  public layerSpacingUniform = uniform(float(2.0));
 
   constructor(scene: THREE.Scene, rendererWrapper: Renderer) {
     this.scene = scene;
@@ -61,6 +81,7 @@ class Scatterplot {
       blendSrc: THREE.OneFactor, // Pre-multiplying in shader
       blendDst: THREE.OneMinusSrcAlphaFactor,
       blendEquation: THREE.AddEquation,
+      side: THREE.DoubleSide // Allow viewing from behind!
     });
 
     // Mathematically perfect continuous Zoom Level calculation
@@ -127,10 +148,9 @@ class Scatterplot {
     
     // World position: instance offset + local vertex position * culledSize
     // 1. Define how far apart the layers should be (e.g., 2.0 World Units)
-    const layerSpacingUniform = uniform(float(2.0));
     // 2. Extrude the Z-axis based on the category color index (0 through 4)
     // This will stack the colors like 5 panes of glass
-    const zDepth = float(colorIndex).mul(layerSpacingUniform);
+    const zDepth = float(colorIndex).mul(this.layerSpacingUniform);
     // 3. Apply it to the 3D offset!
     const offset2D = attribute('offset', 'vec2');
     const offset3D = vec3(offset2D.x, offset2D.y, zDepth);
@@ -143,6 +163,7 @@ class Scatterplot {
     this.pickingMaterial = new MeshBasicNodeMaterial({
       depthWrite: false,
       blending: THREE.NoBlending,
+      side: THREE.DoubleSide // Allow picking from behind!
     });
     
     // Mathematically derive unique RGB picking color on the GPU
@@ -166,7 +187,8 @@ class Scatterplot {
     const hoverMat = new MeshBasicNodeMaterial({ 
       transparent: true, 
       depthTest: false, // Render on top of everything
-      blending: THREE.NormalBlending // Explicitly Normal Blending for true black borders!
+      blending: THREE.NormalBlending, // Explicitly Normal Blending for true black borders!
+      side: THREE.DoubleSide // Allow viewing from behind!
     });
     
     // TSL Math: Draw a circle with a dark border
@@ -276,8 +298,8 @@ class Scatterplot {
     // byte offset is 16 elements per row, color starts at byte 12
     const r = bufferU8[row * 16 + 12];
     const colorIndex = r % 5;
-    // 2.0 spacing perfectly matches our shader extrusion layerSpacingUniform!
-    const zDepth = colorIndex * 2.0;
+    // Dynamically multiply by the uniform so the Ghost Mesh instantly drops to Z=0 in 2D mode!
+    const zDepth = colorIndex * this.layerSpacingUniform.value;
 
     // Sync Ghost Mesh color to the actual palette!
     const activePalette = isWarmPalette ? warmPaletteColors : coolPaletteColors;
@@ -312,6 +334,10 @@ async function init() {
   uiText.innerHTML = `WebGPU is supported!<br/>Streaming Quadtree Tiles...`;
 
   const scatterplot = new Scatterplot(rendererWrapper.scene, rendererWrapper);
+  
+  // Store globally so the buttons can access them
+  rendererInstance = rendererWrapper;
+  scatterplotInstance = scatterplot;
 
   const pickingTexture = new THREE.RenderTarget(window.innerWidth, window.innerHeight, {
     colorSpace: THREE.NoColorSpace

@@ -7,8 +7,7 @@ export interface BoundingBox {
 
 export interface TileData {
   key: string;
-  positions: Float32Array;
-  colors: Float32Array;
+  interleavedBuffer: ArrayBuffer;
   numRows: number;
 }
 
@@ -60,14 +59,14 @@ export class TileManager {
     // Initialize Web Worker
     this.worker = new Worker(new URL('./ArrowWorker.ts', import.meta.url), { type: 'module' });
     this.worker.onmessage = (e) => {
-      const { key, positions, colors, numRows, error } = e.data;
+      const { key, interleavedBuffer, numRows, error } = e.data;
       const resolve = this.pendingRequests.get(key);
       if (resolve) {
-        if (error || !positions) {
+        if (error || !interleavedBuffer) {
           if (error !== '404') console.warn(`Worker error for ${key}:`, error);
           resolve(null);
         } else {
-          resolve({ key, positions, colors, numRows });
+          resolve({ key, interleavedBuffer, numRows });
         }
         this.pendingRequests.delete(key);
       }

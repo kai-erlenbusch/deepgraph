@@ -12,6 +12,10 @@ export class Renderer {
   public dprUniform = uniform(window.devicePixelRatio);
   public worldUnitsPerPixelUniform = uniform(40 / window.innerHeight);
 
+  private raycaster = new THREE.Raycaster();
+  private mouse = new THREE.Vector2();
+  private plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
   constructor(container: HTMLElement) {
     this.renderer = new WebGPURenderer({ antialias: true });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -32,8 +36,11 @@ export class Renderer {
     
     // ENABLE 3D ROTATION
     this.controls.enableRotate = true; 
-    // Prevent the camera from going "underground" below the Z=0 plane
-    this.controls.maxPolarAngle = Math.PI / 2.1; 
+    // Allow full 360 degree rotation (remove maxPolarAngle restriction)
+    this.controls.maxPolarAngle = Math.PI; 
+    
+    // Disable native zoom so we can implement custom Zoom-to-Mouse
+    this.controls.enableZoom = false;
     
     // Reset mouse buttons to standard 3D orbit controls
     this.controls.mouseButtons = {
@@ -43,6 +50,42 @@ export class Renderer {
     };
 
     window.addEventListener('resize', this.onWindowResize.bind(this));
+    this.renderer.domElement.addEventListener('wheel', this.onWheel.bind(this), { passive: false });
+  }
+
+  private onWheel(event: WheelEvent) {
+    event.preventDefault(); // Prevent page scroll
+    
+    // 1. Raycast to Z=0 plane to find the 3D point the mouse is hovering over
+    this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    this.raycaster.setFromCamera(this.mouse, this.camera);
+    
+    const intersection = new THREE.Vector3();
+    if (this.raycaster.ray.intersectPlane(this.plane, intersection)) {
+      // 2. Calculate zoom factor
+      const zoomFactor = event.deltaY > 0 ? 1.1 : 0.9;
+      const alpha = 1 - zoomFactor;
+      
+      // 3. Move camera and target perfectly towards (or away from) the mouse intersection
+      this.camera.position.lerp(intersection, alpha);
+      this.controls.target.lerp(intersection, alpha);
+    }
+  }
+
+  public set2DMode(is2D: boolean) {
+    if (is2D) {
+      this.controls.enableRotate = false;
+      this.controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
+      // Snap to perfect top-down view
+      this.camera.position.set(this.controls.target.x, this.controls.target.y, 50.0);
+    } else {
+      this.controls.enableRotate = true;
+      this.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+      // Tilt back to 45 degree angle
+      this.camera.position.set(this.controls.target.x, this.controls.target.y - 20.0, 50.0);
+    }
+    this.controls.update();
   }
 
   private onWindowResize() {

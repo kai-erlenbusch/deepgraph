@@ -4,9 +4,9 @@ import { tableFromIPC } from 'apache-arrow';
 const hexPalette = [0x173F5F, 0x20639B, 0x3CAEA3, 0xF6D55C, 0xED553B];
 const palette = hexPalette.map(h => {
   return [
-    ((h >> 16) & 255) / 255,
-    ((h >> 8) & 255) / 255,
-    (h & 255) / 255
+    (h >> 16) & 255,
+    (h >> 8) & 255,
+    h & 255
   ];
 });
 
@@ -38,13 +38,15 @@ self.onmessage = async (e: MessageEvent) => {
       return;
     }
 
-    const positions = new Float32Array(numRows * 3);
-    const colors = new Float32Array(numRows * 3);
+    const interleavedBuffer = new ArrayBuffer(numRows * 16);
+    const floatView = new Float32Array(interleavedBuffer);
+    const byteView = new Uint8Array(interleavedBuffer);
     
     for (let i = 0; i < numRows; i++) {
-      positions[i * 3 + 0] = xCol.get(i) as number;
-      positions[i * 3 + 1] = yCol.get(i) as number;
-      positions[i * 3 + 2] = 0;
+      floatView[i * 4 + 0] = xCol.get(i) as number;
+      floatView[i * 4 + 1] = yCol.get(i) as number;
+      floatView[i * 4 + 2] = 0.5 + Math.random() * 2.0; // Size
+      // bytes 12-15 = Color RGBA
 
       let id = 0;
       if (modelIdCol) {
@@ -55,15 +57,16 @@ self.onmessage = async (e: MessageEvent) => {
       }
       
       const c = palette[id];
-      colors[i * 3 + 0] = c[0];
-      colors[i * 3 + 1] = c[1];
-      colors[i * 3 + 2] = c[2];
+      byteView[i * 16 + 12] = c[0]; // R
+      byteView[i * 16 + 13] = c[1]; // G
+      byteView[i * 16 + 14] = c[2]; // B
+      byteView[i * 16 + 15] = 255;  // A
     }
     
-    // Transfer the typed arrays back to the main thread (zero-copy)
+    // Transfer the single buffer back to the main thread (zero-copy)
     self.postMessage(
-      { key, positions, colors, numRows }, 
-      { transfer: [positions.buffer, colors.buffer] }
+      { key, interleavedBuffer, numRows }, 
+      { transfer: [interleavedBuffer] }
     );
     
   } catch (err) {
