@@ -62,5 +62,17 @@ Deepgraph is split into a modular, multi-threaded pipeline designed to prevent m
 3. **`TileManager.ts`:** Handles the spatial Quadtree indexing and Frustum intersection logic. It strictly manages the GPU cache through an LRU eviction policy to prevent VRAM overflow.
 4. **`ArrowWorker.ts`:** A dedicated Web Worker that parses the Apache Arrow binary files from the network, mapping vectors into WebGPU-ready 16-byte interleaved buffers.
 
-## 📄 License
-MIT License
+## 📚 Citing
+
+If you use this software in your work or scientific research, it is important to properly cite it to acknowledge the contribution of the developers. When citing, please include the following metadata:
+
+[Insert Names/Title/Year] [Computer software]. https://github.com/kai-erlenbusch/deepgraph-GAIA-sandbox
+
+This citation should include the names of the developers, the year of publication, the title of the software, and the medium (Computer software). The URL should also be included to provide a direct link to the software.
+
+## 📄 Licensing
+
+This project is freely available for non-commercial use under the **Creative Commons Attribution Non Commercial CC BY-NC 4.0** public license. Please note that this license does not permit commercial use of the software. For more information about the limitations of this license, you can refer to the [CC BY-NC 4.0 License Deed](https://creativecommons.org/licenses/by-nc/4.0/).
+
+If you’re planning to use this software commercially, please reach out to us for a Business license.
+
