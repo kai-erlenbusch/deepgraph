@@ -1,6 +1,6 @@
 # Deepgraph Public JavaScript / TypeScript API (`v0.1 — Phase 8 / D11`)
 
-> **Status:** Complete & Verified (`v0.1.0` — `D12a` npm package: `deepgraph`; `D12b` license: `CC-BY-NC-4.0` + commercial license via `erlenbusch@uchicago.edu`; held `"private": true` pending Owner Release Gate `⛔ D12c`).
+> **Status:** `v0.1.0` (`npm install deepgraph`; license: `CC-BY-NC-4.0` + commercial license via `erlenbusch@uchicago.edu`).
 
 `Deepgraph` is an embeddable WebGPU compute scatterplot & spatial-pyramid library for streaming multi-million to billion-point **`.arrowtiles` (`v0.1`)** archives over HTTP Range requests or local `File` handles.
 
@@ -226,7 +226,7 @@ const skySurveyPreset: DeepgraphPreset = {
   - **`"./standalone"`** (`import { Deepgraph } from 'deepgraph/standalone'`): `{ "types": "./dist/index.d.ts", "import": "./dist/standalone.js" }` — **Zero-build standalone entry** bundling all runtime dependencies for direct `<script type="module">` HTML pages (see [`examples/embed.html`](../examples/embed.html)).
 - **`"main"` / `"module"`:** `"./dist/index.js"` (`"type": "module"`, `"sideEffects": false`)
 - **`"types"`:** `"./dist/index.d.ts"` (emitted with `"rootDir": "./src"` and `"stripInternal": true`, rewritten to `.js` relative specifiers so standard downstream TypeScript projects pass `tsc --noEmit` under both `bundler` and `nodenext` without `allowImportingTsExtensions` or `@webgpu/types`)
-- **`"license"`:** `"CC-BY-NC-4.0"` (free for non-commercial use; commercial use requires a separate license via `erlenbusch@uchicago.edu` — see `LICENSE` and `NOTICE`; `"name": "deepgraph"`, `"files": ["dist", "docs/API.md", "LICENSE", "NOTICE"]`; `"private": true` preserved until owner publish gate `⛔ D12c`)
+- **`"license"`:** `"CC-BY-NC-4.0"` (free for non-commercial use; commercial use requires a separate license via `erlenbusch@uchicago.edu` — see `LICENSE` and `NOTICE`; `"name": "deepgraph"`, `"files": ["dist", "docs/API.md", "LICENSE", "NOTICE"]`)
 
 ### Build & Verification Commands
 

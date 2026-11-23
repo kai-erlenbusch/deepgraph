@@ -1,6 +1,5 @@
 {
   "name": "deepgraph",
-  "private": true,
   "version": "0.1.0",
   "description": "WebGPU billion-point and graph visualization engine for .arrowtiles spatial pyramids",
   "author": "Kai Erlenbusch <erlenbusch@uchicago.edu>",

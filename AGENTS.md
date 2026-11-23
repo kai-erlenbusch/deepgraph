@@ -82,7 +82,7 @@ npm run test:e2e:heavy   # Heavy 5-gate VRAM/LRU suite (requires local `public/g
 
 - **Sample Archives for Local `test:e2e`:** Vite's range server (`vite.config.ts`) resolves `/samples/*.arrowtiles` from `../arrowtiles/samples/` (falling back to `../duckdb-arrowtiles/samples/`). Generate them from the sibling `arrowtiles` repo via `python scripts/build_samples.py` if missing.
 - **Discrete GPU Coexistence:** Playwright uses `--force_low_power_gpu` (`playwright.config.ts`) and `powerPreference: 'low-power'` so automated browser tests run on the integrated GPU without contending with discrete CUDA/ML workloads.
-- **Release Gate:** Keep `"private": true` in `package.json` and do **not** run `git push` or `npm publish` unless explicitly instructed by the repository owner.
+- **Release Gate:** Do **not** run `git push` or `npm publish` unless explicitly instructed by the repository owner.
 
 ---
 
