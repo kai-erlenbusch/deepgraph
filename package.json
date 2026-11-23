@@ -1,0 +1,72 @@
+{
+  "name": "deepgraph",
+  "private": true,
+  "version": "0.1.0",
+  "description": "WebGPU billion-point and graph visualization engine for .arrowtiles spatial pyramids",
+  "author": "Kai Erlenbusch <erlenbusch@uchicago.edu>",
+  "license": "CC-BY-NC-4.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kai-erlenbusch/deepgraph.git"
+  },
+  "homepage": "https://github.com/kai-erlenbusch/deepgraph#readme",
+  "bugs": {
+    "url": "https://github.com/kai-erlenbusch/deepgraph/issues"
+  },
+  "keywords": [
+    "webgpu",
+    "arrowtiles",
+    "scatterplot",
+    "point-cloud",
+    "graph",
+    "visualization",
+    "pmtiles",
+    "apache-arrow"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./standalone": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/standalone.js"
+    }
+  },
+  "files": [
+    "dist",
+    "docs/API.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run build:lib",
+    "build:lib": "vite build --config vite.lib.config.ts && vite build --config vite.standalone.config.ts && node scripts/emit_dts.mjs",
+    "build:demo": "vite build --outDir dist-demo",
+    "preview": "vite preview --outDir dist-demo",
+    "typecheck": "tsc --noEmit",
+    "verify:types": "node scripts/verify_consumer_dts.mjs",
+    "test:e2e": "playwright test tests/library-embed.spec.ts tests/phase8b-hdr-density.spec.ts tests/picking-layer.spec.ts",
+    "test:e2e:heavy": "playwright test tests/gpu-vram-lifecycle.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@webgpu/types": "^0.1.71",
+    "lil-gui": "^0.21.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.0.12"
+  },
+  "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27",
+    "apache-arrow": "^21.1.0",
+    "fflate": "^0.8.3",
+    "p-queue": "^9.3.0",
+    "pmtiles": "^4.4.1"
+  }
+}

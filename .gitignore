@@ -1,0 +1,40 @@
+# Node and Vite
+node_modules/
+dist/
+dist-demo/
+dist-ssr/
+.npm/
+
+# Data Files
+s3_cache/
+data/
+*.arrowtiles
+*.pmtiles
+*.parquet
+*.feather
+public/*.arrowtiles
+public/*.pmtiles
+public/*.parquet
+duckdb_temp/
+archive/
+scratch/
+research/
+
+# Logs (keep historic transcripts ignored; track numbered engineering logs)
+logs/*
+!logs/README.md
+!logs/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]_*.md
+
+# Playwright & Test Artifacts
+playwright-report/
+test-results/
+.pytest_cache/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc

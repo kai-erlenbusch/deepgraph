@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Deepgraph Minimal Single-HTML Embed</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0e1015; color: #e8ecf4; font-family: system-ui, monospace; }
+      #plot { width: 100vw; height: 100vh; }
+      #hit-readout {
+        position: fixed; top: 12px; left: 12px; padding: 8px 12px; border-radius: 6px;
+        background: rgba(16, 19, 27, 0.88); border: 1px solid rgba(143, 211, 255, 0.35);
+        font: 12px/1.45 ui-monospace, monospace; pointer-events: none; max-width: 380px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="plot"></div>
+    <div id="hit-readout">Loading <code>lmsys_sample.arrowtiles</code>… (click a point to inspect)</div>
+    <script type="module">
+      import { Deepgraph } from '../dist/standalone.js';
+
+      const readout = document.getElementById('hit-readout');
+      const powerPreference =
+        new URLSearchParams(location.search).get('power') === 'low' ? 'low-power' : 'high-performance';
+
+      const plot = await Deepgraph.create(document.getElementById('plot'), {
+        url: '/samples/lmsys_sample.arrowtiles',
+        powerPreference,
+        encoding: { color: 'model', aggregation: 'points' },
+      });
+
+      const meta = plot.getMetadata();
+      readout.textContent = `Loaded ${(meta?.totalRows ?? 0).toLocaleString()} rows — click or hover any point`;
+
+      plot.on('click', (hit) => {
+        readout.textContent = hit
+          ? `Clicked row_id=${hit.rowId} (${hit.dataX.toFixed(2)}, ${hit.dataY.toFixed(2)}) ${JSON.stringify(hit.attributes)}`
+          : 'Clicked empty background (selection cleared)';
+      });
+      window.__embedPlot = plot;
+    </script>
+  </body>
+</html>
