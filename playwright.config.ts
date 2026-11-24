@@ -1,7 +1,10 @@
 import { defineConfig } from '@playwright/test';
 
+const allowDgpu = process.env.DEEPGRAPH_ALLOW_DGPU === '1';
+
 export default defineConfig({
   testDir: './tests',
+  outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR || './test-results',
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: 0,
@@ -22,7 +25,7 @@ export default defineConfig({
           args: [
             '--enable-unsafe-webgpu',
             '--ignore-gpu-blocklist',
-            '--force_low_power_gpu',
+            allowDgpu ? '--force_high_performance_gpu' : '--force_low_power_gpu',
             '--disable-background-timer-throttling',
             '--disable-renderer-backgrounding',
             '--disable-backgrounding-occluded-windows',

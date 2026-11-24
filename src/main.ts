@@ -1,4 +1,4 @@
-import { Deepgraph, type DeepgraphPlot } from './index.ts';
+import { Deepgraph, type DeepgraphPlot, type TileSource } from './index.ts';
 import { ControlsPanel, TelemetryHud } from './demo/ControlsPanel.ts';
 import { resolveDemoPreset } from './demo/gaiaPreset.ts';
 import { installGpuStatsInstrumentation } from './demo/gpuStats.ts';
@@ -49,7 +49,7 @@ async function initDemoApp() {
     plot.on('telemetry', (snap) => hud.update(snap));
     plot.on('error', (err) => hud.setError(err.message));
 
-    async function loadDataset(source: string | File) {
+    async function loadDataset(source: TileSource) {
         hud.setStatus('Loading dataset schema...');
         try {
             const summary = await plot.load(source, { preset: resolveDemoPreset });

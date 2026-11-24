@@ -7,6 +7,7 @@ const FLOATS_PER_MARKER = 8; // centerNdc.xy, radiusNdc.xy, innerOuterPx.xy, col
 export interface HighlightMarkerSpec {
     kind: 'hover' | 'selected';
     rowId: number;
+    rowIdBigInt?: bigint;
     rawRowIdx: number;
     tileZ: number;
     tileX: number;
@@ -24,17 +25,22 @@ function pcgHashJS(vIn: number): number {
     return res / 4294967295.0;
 }
 
-function mapLinearJS(
-    val: number,
-    domMin: number,
-    domMax: number,
-    rangeMin: number,
-    rangeMax: number
-): number {
-    const span = domMax - domMin;
-    const safeSpan = Math.abs(span) < 1e-12 ? 1.0 : span;
-    const t = Math.max(0.0, Math.min(1.0, (val - domMin) / safeSpan));
-    return rangeMin + (rangeMax - rangeMin) * t;
+function isSameHighlightMarker(a: HighlightMarkerSpec, b: HighlightMarkerSpec): boolean {
+    if (
+        a.tileZ === b.tileZ &&
+        a.tileX === b.tileX &&
+        a.tileY === b.tileY &&
+        a.rawRowIdx === b.rawRowIdx
+    ) {
+        return true;
+    }
+    if (a.rowIdBigInt !== undefined && b.rowIdBigInt !== undefined) {
+        return a.rowIdBigInt === b.rowIdBigInt;
+    }
+    if (a.rowIdBigInt !== undefined || b.rowIdBigInt !== undefined) {
+        return false;
+    }
+    return a.rowId >= 0 && b.rowId >= 0 && a.rowId === b.rowId;
 }
 
 /**
@@ -223,10 +229,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         subX: number,
         subY: number,
         isYAxis: boolean,
-        camLeftOrTop: number
+        camLeftOrTop: number,
+        tileStore: TileGpuStore
     ): number | null {
-        const isSpatial =
-            axis.field === 'x_u16' || axis.field === 'y_u16' || axis.transform === 'literal';
+        const isSpatial = axis.field === 'x_u16' || axis.field === 'y_u16';
         if (isSpatial) {
             const isY16 = axis.field === 'y_u16';
             const scale = Math.pow(2.0, -marker.tileZ);
@@ -243,16 +249,35 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         }
 
         const rawVal = marker.attributes[axis.field];
-        const numVal = typeof rawVal === 'number' ? rawVal : Number(rawVal);
+        let numVal: number;
+        if (typeof rawVal === 'number') {
+            numVal = rawVal;
+        } else if (typeof rawVal === 'string') {
+            const dict = tileStore.categoricalDictionaries[axis.field];
+            const dictIdx = dict && dict.length > 0 ? dict.indexOf(rawVal) : -1;
+            numVal = dictIdx >= 0 ? dictIdx : Number(rawVal);
+        } else {
+            numVal = Number(rawVal);
+        }
         if (!Number.isFinite(numVal)) return null;
-        const mapped = mapLinearJS(
-            numVal,
-            axis.domain[0],
-            axis.domain[1],
-            axis.range[0],
-            axis.range[1]
-        );
-        return isYAxis ? camLeftOrTop - mapped : mapped - camLeftOrTop;
+
+        const shiftedVal = numVal - (tileStore.colOrigins[axis.field] ?? 0);
+        const effVal =
+            axis.transform === 'literal'
+                ? shiftedVal
+                : Math.max(
+                      Math.min(axis.domain[0], axis.domain[1]),
+                      Math.min(Math.max(axis.domain[0], axis.domain[1]), shiftedVal)
+                  );
+        const domSpan = axis.domain[1] - axis.domain[0];
+        const safeDomSpan = Math.abs(domSpan) < 1e-12 ? 1.0 : domSpan;
+        const worldSpan = axis.range[1] - axis.range[0];
+        if (Math.abs(worldSpan) < 1e-12) {
+            return isYAxis ? camLeftOrTop - axis.range[0] : axis.range[0] - camLeftOrTop;
+        }
+        const worldScale = worldSpan / safeDomSpan;
+        const camAnchorData = axis.domain[0] + (camLeftOrTop - axis.range[0]) / worldScale;
+        return (effVal - camAnchorData) * (isYAxis ? -worldScale : worldScale);
     }
 
     public encodePass(
@@ -299,14 +324,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         if (
             this.hoverMarker &&
             queueList.length < MAX_OVERLAY_MARKERS &&
-            !queueList.some(
-                (s) =>
-                    s.rowId === this.hoverMarker!.rowId ||
-                    (s.tileZ === this.hoverMarker!.tileZ &&
-                        s.tileX === this.hoverMarker!.tileX &&
-                        s.tileY === this.hoverMarker!.tileY &&
-                        s.rawRowIdx === this.hoverMarker!.rawRowIdx)
-            )
+            !queueList.some((s) => isSameHighlightMarker(s, this.hoverMarker!))
         ) {
             queueList.push(this.hoverMarker);
         }
@@ -316,8 +334,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
             const subX = m.xU16 / 65535.0 + (pcgHashJS(m.rawRowIdx) - 0.5) / 65535.0;
             const subY = m.yU16 / 65535.0 + (pcgHashJS(m.rawRowIdx + 12345) - 0.5) / 65535.0;
 
-            let relX = this.projectAxisRelWorld(xAxis, m, subX, subY, false, camLeft);
-            let fromTopY = this.projectAxisRelWorld(yAxis, m, subX, subY, true, camTop);
+            let relX = this.projectAxisRelWorld(xAxis, m, subX, subY, false, camLeft, tileStore);
+            let fromTopY = this.projectAxisRelWorld(yAxis, m, subX, subY, true, camTop, tileStore);
             if (relX === null || fromTopY === null) continue;
 
             if (isTransitioning) {
@@ -327,7 +345,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     subX,
                     subY,
                     false,
-                    camLeft
+                    camLeft,
+                    tileStore
                 );
                 const prevFromTopY = this.projectAxisRelWorld(
                     prevCfg.y,
@@ -335,7 +354,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
                     subX,
                     subY,
                     true,
-                    camTop
+                    camTop,
+                    tileStore
                 );
                 if (prevRelX !== null && prevFromTopY !== null) {
                     const t = tileStore.transitionT;

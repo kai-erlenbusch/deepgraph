@@ -1,5 +1,12 @@
 import { test, expect, type Page } from '@playwright/test';
 
+const GAIA_FILE = process.env.DEEPGRAPH_GAIA_FILE || '/gaia_full.arrowtiles';
+const ALLOW_DGPU = process.env.DEEPGRAPH_ALLOW_DGPU === '1';
+const POWER_PREF: 'high-performance' | 'low-power' = ALLOW_DGPU
+  ? 'high-performance'
+  : 'low-power';
+const POWER_QUERY = ALLOW_DGPU ? 'high' : 'low';
+
 async function measureTwoFrameStability(page: Page) {
   // Wait >350ms so tile spawn fadeAlpha = smoothstep(0.0, 0.3, age) is 1.0 on all loaded slots
   await page.waitForTimeout(450);
@@ -92,12 +99,12 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
       }
     });
 
-    await page.goto('/');
+    await page.goto(`/?file=${encodeURIComponent(GAIA_FILE)}&power=${POWER_QUERY}`);
 
-    // 1a. Verify real hardware WebGPU adapter (not SwiftShader / fallback)
-    const adapterCheck = await page.evaluate(async () => {
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-      if (!adapter) return { ok: false, info: null };
+    // 1a. Verify real hardware WebGPU adapter (not SwiftShader / fallback) & GPU coexistence policy
+    const adapterCheck = await page.evaluate(async (pref) => {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: pref });
+      if (!adapter) return { ok: false, info: null, isFallbackAdapter: true, vendor: '', architecture: '', description: '' };
       const info: any = (adapter as any).info || {};
       return {
         ok: true,
@@ -106,11 +113,16 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
         architecture: String(info.architecture || ''),
         description: String(info.description || ''),
       };
-    });
-    console.log('[Gate 1a Adapter]', JSON.stringify(adapterCheck));
+    }, POWER_PREF);
+    console.log('[Gate 1a Adapter]', JSON.stringify({ gaiaFile: GAIA_FILE, allowDgpu: ALLOW_DGPU, adapterCheck }));
     expect(adapterCheck.ok).toBe(true);
     expect(adapterCheck.isFallbackAdapter).toBe(false);
     expect(adapterCheck.description.toLowerCase()).not.toContain('swiftshader');
+    if (!ALLOW_DGPU) {
+      expect(adapterCheck.vendor.toLowerCase()).not.toBe('nvidia');
+    } else {
+      expect(adapterCheck.vendor.toLowerCase()).toBe('nvidia');
+    }
 
     // 1b. Zoom slightly so >= 20 active tiles load on gaia_full.arrowtiles and > 0 active points render
     await page.waitForFunction(() => Boolean((window as any).__viewer?.plot?.getMetadata()), null, {
@@ -280,7 +292,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
     // =========================================================================
     // GATE 2: Deterministic deep-zoom panning trajectory exceeding maxTileCache (40)
     // =========================================================================
-    const gate2 = await page.evaluate(async () => {
+    const gate2 = await page.evaluate(async ({ gaiaFile, powerPref }) => {
       const { installGpuStatsInstrumentation, getGpuStats } = await import('/src/demo/gpuStats.ts');
       installGpuStatsInstrumentation();
       const { Deepgraph } = await import('/src/index.ts');
@@ -290,8 +302,9 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
       const stage = document.getElementById('stage')!;
       const maxTileCache = 40;
       const plot = await Deepgraph.create(stage, {
-        url: '/gaia_full.arrowtiles',
+        url: gaiaFile,
         preset: resolveDemoPreset,
+        powerPreference: powerPref,
         maxTileCache,
         detailOffset: 2,
       });
@@ -356,7 +369,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
         finalCs,
         afterDestroyGs,
       };
-    });
+    }, { gaiaFile: GAIA_FILE, powerPref: POWER_PREF });
 
     console.log(
       '[Gate 2 Deep-Zoom Eviction Summary]',
@@ -387,14 +400,14 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
     // =========================================================================
     // GATE 3: Superseded load() AbortError + 5x Full Dataset Swaps Back to Baseline
     // =========================================================================
-    const gate3 = await page.evaluate(async () => {
+    const gate3 = await page.evaluate(async (powerPref) => {
       const { getGpuStats } = await import('/src/demo/gpuStats.ts');
       const { Deepgraph } = await import('/src/index.ts');
       const { INTERNAL_DIAGNOSTICS } = await import('/src/lib/diagnostics.ts');
       const { resolveDemoPreset } = await import('/src/demo/gaiaPreset.ts');
 
       const stage = document.getElementById('stage')!;
-      const plot = await Deepgraph.create(stage, { maxTileCache: 80 });
+      const plot = await Deepgraph.create(stage, { maxTileCache: 80, powerPreference: powerPref });
       const diag = (plot as any)[INTERNAL_DIAGNOSTICS]();
 
       const waitIdle = async () => {
@@ -461,7 +474,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
         swapHistory,
         afterDestroyGs,
       };
-    });
+    }, POWER_PREF);
 
     console.log('[Gate 3 5x Dataset Swaps]', JSON.stringify(gate3));
     expect(gate3.supersededErrorName).toBe('AbortError');
@@ -475,7 +488,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
     // =========================================================================
     // GATE 4: 20x Deepgraph.create() + plot.destroy() Loop (0 Device / Buffer / Canvas Leak)
     // =========================================================================
-    const gate4 = await page.evaluate(async () => {
+    const gate4 = await page.evaluate(async (powerPref) => {
       const { Deepgraph } = await import('/src/index.ts');
       const stage = document.getElementById('stage')!;
       const before = { ...(window as any).__gpuStats };
@@ -483,6 +496,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
       for (let i = 0; i < 20; i++) {
         const p = await Deepgraph.create(stage, {
           url: '/samples/lmsys_sample.arrowtiles',
+          powerPreference: powerPref,
           encoding: { color: 'clusters_14' },
         });
         const deadline = performance.now() + 8000;
@@ -501,7 +515,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
         devicesDestroyedDelta: after.totalDevicesDestroyed - before.totalDevicesDestroyed,
         remainingCanvases: stage.querySelectorAll('canvas').length,
       };
-    });
+    }, POWER_PREF);
 
     console.log('[Gate 4 20x Create/Destroy Loop]', JSON.stringify(gate4));
     expect(gate4.devicesCreatedDelta).toBe(20);
@@ -515,7 +529,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
     // =========================================================================
     // GATE 5: Mandatory Negative-Control Check (Deliberate Eviction Leak Caught!)
     // =========================================================================
-    const gate5 = await page.evaluate(async () => {
+    const gate5 = await page.evaluate(async ({ gaiaFile, powerPref }) => {
       const { getGpuStats } = await import('/src/demo/gpuStats.ts');
       const { Deepgraph } = await import('/src/index.ts');
       const { INTERNAL_DIAGNOSTICS } = await import('/src/lib/diagnostics.ts');
@@ -523,9 +537,10 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
 
       const stage = document.getElementById('stage')!;
       const plot = await Deepgraph.create(stage, {
-        url: '/gaia_full.arrowtiles',
+        url: gaiaFile,
         preset: resolveDemoPreset,
-        maxTileCache: 20,
+        powerPreference: powerPref,
+        maxTileCache: 32,
         detailOffset: 2,
       });
       const diag = (plot as any)[INTERNAL_DIAGNOSTICS]();
@@ -563,7 +578,7 @@ test.describe('Phase 6 — Real-GPU WebGPU VRAM, GPUDevice & CPU Buffer Lifecycl
         flushedCount,
         afterCleanupGs,
       };
-    });
+    }, { gaiaFile: GAIA_FILE, powerPref: POWER_PREF });
 
     console.log('[Gate 5 Negative Control]', JSON.stringify(gate5));
     expect(gate5.invariantFailedAsExpected).toBe(true);

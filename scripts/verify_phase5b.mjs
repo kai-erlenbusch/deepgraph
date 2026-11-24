@@ -77,10 +77,16 @@ async function main() {
     const baseUrl = `http://127.0.0.1:${addr.port}`;
     console.log(`[verify_phase5b] Ephemeral Vite server running at ${baseUrl}`);
 
+    const allowDgpu = process.env.DEEPGRAPH_ALLOW_DGPU === '1';
+    const powerQuery = allowDgpu ? 'high' : 'low';
     const browser = await chromium.launch({
         channel: 'chrome',
         headless: false,
-        args: ['--enable-unsafe-webgpu', '--ignore-gpu-blocklist'],
+        args: [
+            '--enable-unsafe-webgpu',
+            '--ignore-gpu-blocklist',
+            allowDgpu ? '--force_high_performance_gpu' : '--force_low_power_gpu',
+        ],
     });
 
     const pageErrors = [];
@@ -225,7 +231,10 @@ async function main() {
         // =========================================================================
         // CHECK 3: URL sanitization in src/main.ts (?file=//... and ?file=/\...)
         // =========================================================================
-        for (const badQuery of ['?file=//evil.example/x.arrowtiles', '?file=/%5Cevil.arrowtiles']) {
+        for (const badQuery of [
+            `?file=//evil.example/x.arrowtiles&power=${powerQuery}`,
+            `?file=/%5Cevil.arrowtiles&power=${powerQuery}`,
+        ]) {
             await page.goto(`${baseUrl}/${badQuery}`, { waitUntil: 'domcontentloaded' });
             await page.waitForFunction(() => Boolean(window.__viewer?.plot?.getMetadata()), null, {
                 timeout: 15000,

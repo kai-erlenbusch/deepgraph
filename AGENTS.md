@@ -28,8 +28,9 @@ Engineering context, architectural invariants, and verification commands for AI 
 ```text
 src/
 ├── index.ts                 # Public library entry (`export { Deepgraph }` + public TS types ONLY)
-├── PMTilesClient.ts         # HTTP Range / File PMTiles v3 client, worker pool & compressed pick LRU
-├── pmtiles.worker.ts        # Off-main-thread Zstd WASM (`@bokuweb/zstd-wasm`) + Arrow IPC decoder
+├── PMTilesClient.ts         # HTTP Range / File / CustomRangeSource PMTiles v3 client & worker pool
+├── pmtiles.worker.ts        # Off-main-thread Zstd WASM (`@bokuweb/zstd-wasm`) + `@uwdata/flechette` worker
+├── workerCodec.ts           # Pure Arrow IPC column/row extraction, 1D RTO & Zstd frame-header guard
 ├── core/
 │   ├── Renderer.ts          # Plain-WebGPU adapter/device/swapchain, Camera2D & pointer/wheel input
 │   ├── TileGpuStore.ts      # Bounded LRU GPU storage-buffer slots + Float64 RTC coordinate uniforms
@@ -48,7 +49,7 @@ src/
 ```
 
 ### Mandatory Library Boundaries
-1. **Zero Demo Leakage in Library Code:** Files under `src/index.ts`, `src/lib/*`, `src/core/*`, `src/PMTilesClient.ts`, and `src/pmtiles.worker.ts` **MUST NOT** import `lil-gui` or `src/demo/*`, read `window.location`, mutate DOM elements outside the host `container` passed to `Deepgraph.create(...)`, or monkey-patch WebGPU prototypes (`window.__gpuStats`).
+1. **Zero Demo Leakage in Library Code:** Files under `src/index.ts`, `src/lib/*`, `src/core/*`, `src/PMTilesClient.ts`, `src/pmtiles.worker.ts`, and `src/workerCodec.ts` **MUST NOT** import `lil-gui` or `src/demo/*`, read `window.location`, mutate DOM elements outside the host `container` passed to `Deepgraph.create(...)`, or monkey-patch WebGPU prototypes (`window.__gpuStats`).
 2. **Zero Three.js / WebGL:** All rendering runs through plain WebGPU (`ComputeRasterizer` + `HighlightOverlay`). Do not introduce Three.js or WebGL dependencies.
 3. **No Main-Thread $O(N)$ Data Loops:** Tile decompression, Arrow IPC column extraction, and per-row pick decoding happen inside `pmtiles.worker.ts` or WGSL compute shaders.
 
@@ -63,18 +64,18 @@ src/
 3. **Deterministic GPU Memory Teardown:**
    - Every `GPUBuffer` allocated by `TileGpuStore`, `ComputeRasterizer`, `PickingLayer`, and `HighlightOverlay` must be explicitly `.destroy()`ed upon LRU eviction and `plot.destroy()`, followed by `context.unconfigure()` and `device.destroy()` (`liveDevices === 0`, `liveBytes === 0`).
 4. **Dual Library Build & Self-Contained Worker (`npm run build:lib`):**
-   - `dist/index.js` (`"."` export) externalizes main-thread runtime packages (`pmtiles`, `p-queue`, `fflate`, `apache-arrow`, `@bokuweb/zstd-wasm`) so downstream bundlers deduplicate `apache-arrow`.
-   - `dist/standalone.js` (`"./standalone"` export) bundles all runtime dependencies for zero-build `<script type="module">` HTML embeds (`examples/embed.html`).
-   - In **both** builds, `dist/assets/pmtiles.worker-*.js` **must** remain 100% self-contained (`0` bare specifiers) with `zstd.wasm` inlined as a `data:application/wasm;base64,...` URI. Always run `npm run verify:types` after build changes.
+   - `dist/index.js` (`"."` export) externalizes runtime packages (`pmtiles`, `p-queue`, `fflate`, `@uwdata/flechette`, `@bokuweb/zstd-wasm`) with `0 B` main-thread Arrow parser weight, and emits a self-contained `dist/assets/pmtiles.worker-*.js` (`0` bare specifiers, inlined `data:application/wasm;base64,...` `zstd.wasm`).
+   - `dist/standalone.js` (`"./standalone"` export) bundles all runtime dependencies AND inlines the worker as a cached `Blob` URL (`URL.createObjectURL`) for single-file `<script type="module">`, `blob:`, and `anywidget` embeds (`examples/embed.html`). Always run `npm run verify:types` after build changes.
 
 ---
 
 ## 5. Build, Verification & GPU Coexistence Commands
 
 ```bash
-npm run typecheck        # Strict TypeScript check (`tsc --noEmit`)
-npm run build:lib        # Build `dist/index.js`, `dist/standalone.js`, worker & clean `.d.ts`
+npm run typecheck        # Strict TypeScript check (`tsc --noEmit` + `tsconfig.unit.json`)
+npm run build:lib        # Build `dist/index.js`, single-file `dist/standalone.js`, worker & `.d.ts`
 npm run verify:types     # External `tsc` (`bundler` + `nodenext`) + real downstream `vite build`
+npm run test:unit        # Node.js (`node:test`) worker IPC codec & ViewState unit tests
 npm run build:demo       # Build standalone demo app into `dist-demo/`
 npm run test:e2e         # Fast Playwright E2E suite (< 5 MiB samples in `../arrowtiles/samples/`)
 npm run test:e2e:heavy   # Heavy 5-gate VRAM/LRU suite (requires local `public/gaia_full.arrowtiles` + `25k` sample)

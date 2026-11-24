@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ["main", "master"]
 
+permissions:
+  contents: read
+
 jobs:
   build-and-verify:
     runs-on: ubuntu-latest
@@ -19,10 +22,10 @@ jobs:
           node-version: "24"
           cache: "npm"
 
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
+      - name: Install dependencies (deterministic lockfile)
+        run: npm ci
 
-      - name: Typecheck source
+      - name: Typecheck source & unit tests
         run: npm run typecheck
 
       - name: Build bundler & standalone library bundles + declarations
@@ -30,6 +33,9 @@ jobs:
 
       - name: Verify external consumer TypeScript (bundler + nodenext) & Vite app build
         run: npm run verify:types
+
+      - name: Run unit tests
+        run: npm run test:unit
 
       - name: Build standalone demo application
         run: npm run build:demo

@@ -79,6 +79,7 @@ for (const dtsPath of dtsFiles) {
         'PMTilesClient',
         'lil-gui',
         'three',
+        'apache-arrow',
     ]) {
         if (content.includes(forbidden)) {
             throw new Error(`Forbidden internal/retired symbol '${forbidden}' leaked into ${dtsPath}`);
@@ -117,6 +118,13 @@ for (const expectedExt of ['pmtiles', 'p-queue', 'fflate']) {
         );
     }
 }
+for (const forbiddenMainArrow of ['apache-arrow', '@uwdata/flechette']) {
+    if (indexBareImports.includes(forbiddenMainArrow) || indexJs.includes(forbiddenMainArrow)) {
+        throw new Error(
+            `Main-thread dist/index.js must carry 0 B Arrow parser weight, found '${forbiddenMainArrow}'`
+        );
+    }
+}
 if (Buffer.byteLength(indexJs, 'utf8') > 220 * 1024) {
     throw new Error(
         `dist/index.js (${Buffer.byteLength(indexJs, 'utf8')} B) exceeds 220 KiB externalized bundler ceiling`
@@ -130,11 +138,18 @@ if (standaloneBareImports.length > 0) {
         `dist/standalone.js must be 100% self-contained for <script type="module">, found bare imports: ${JSON.stringify(standaloneBareImports)}`
     );
 }
+if (standaloneJs.includes('pmtiles.worker-') || !standaloneJs.includes('URL.createObjectURL')) {
+    throw new Error(
+        'dist/standalone.js must inline its Web Worker via cached URL.createObjectURL(Blob) with zero external pmtiles.worker-*.js references'
+    );
+}
 
 const jsFiles = walkFiles(distDir).filter((f) => f.endsWith('.js'));
 const workerFiles = jsFiles.filter((f) => path.basename(f).startsWith('pmtiles.worker-'));
-if (workerFiles.length === 0) {
-    throw new Error('No dist/assets/pmtiles.worker-*.js chunk emitted');
+if (workerFiles.length !== 1) {
+    throw new Error(
+        `Expected exactly 1 dist/assets/pmtiles.worker-*.js chunk (for dist/index.js), found ${workerFiles.length}: ${workerFiles.map((f) => path.basename(f)).join(', ')}`
+    );
 }
 
 for (const workerPath of workerFiles) {

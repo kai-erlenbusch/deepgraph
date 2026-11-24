@@ -73,8 +73,7 @@ export class ViewState {
             this.pipeline === 'optical' ||
             this.xField === null ||
             this.xField === 'x_u16' ||
-            this.xField === 'y_u16' ||
-            this.xTransform === 'literal'
+            this.xField === 'y_u16'
         );
     }
 
@@ -83,8 +82,16 @@ export class ViewState {
             this.pipeline === 'optical' ||
             this.yField === null ||
             this.yField === 'y_u16' ||
-            this.yField === 'x_u16' ||
-            this.yTransform === 'literal'
+            this.yField === 'x_u16'
+        );
+    }
+
+    public get hasCustomWorldScale(): boolean {
+        return (
+            (!this.isSpatialX &&
+                (this.xTransform === 'literal' || this.customXRange !== undefined)) ||
+            (!this.isSpatialY &&
+                (this.yTransform === 'literal' || this.customYRange !== undefined))
         );
     }
 
@@ -329,10 +336,12 @@ export class ViewState {
                 }
             }
 
-            if (
-                this.pipeline === 'optical' &&
-                !internalOpts?.preserveOpticalIfUnchanged
-            ) {
+            const requestedScale =
+                typeof encoding.color === 'object' ? encoding.color.scale : undefined;
+            const keepsOptical =
+                internalOpts?.preserveOpticalIfUnchanged ||
+                (this.colorField === this.opticalColorField && requestedScale === undefined);
+            if (this.pipeline === 'optical' && !keepsOptical) {
                 this.pipeline = 'cartesian';
             }
             if (
@@ -516,29 +525,57 @@ export class ViewState {
             ? session.summary.stats[internalYField]
             : undefined;
 
+        const xCats =
+            internalXField !== 'x_u16' && internalXField !== 'y_u16'
+                ? session.summary.categories[internalXField]
+                : undefined;
+        const yCats =
+            internalYField !== 'y_u16' && internalYField !== 'x_u16'
+                ? session.summary.categories[internalYField]
+                : undefined;
+
         const defaultXDomain: [number, number] =
-            xStat && xStat.type !== 'categorical' && Number.isFinite(xStat.min) && Number.isFinite(xStat.max)
-                ? [xStat.min, xStat.max]
-                : [0, 1];
+            xCats && xCats.length > 0
+                ? [0, Math.max(1, xCats.length - 1)]
+                : xStat &&
+                    xStat.type !== 'categorical' &&
+                    Number.isFinite(xStat.min) &&
+                    Number.isFinite(xStat.max)
+                  ? [xStat.min, xStat.max]
+                  : [0, 1];
         const defaultYDomain: [number, number] =
-            yStat && yStat.type !== 'categorical' && Number.isFinite(yStat.min) && Number.isFinite(yStat.max)
-                ? [yStat.min, yStat.max]
-                : [0, 1];
+            yCats && yCats.length > 0
+                ? [0, Math.max(1, yCats.length - 1)]
+                : yStat &&
+                    yStat.type !== 'categorical' &&
+                    Number.isFinite(yStat.min) &&
+                    Number.isFinite(yStat.max)
+                  ? [yStat.min, yStat.max]
+                  : [0, 1];
 
         const xDomain = this.customXDomain ?? defaultXDomain;
         const yDomain = this.customYDomain ?? defaultYDomain;
 
-        const defaultXRange: [number, number] = [rb.minX, rb.maxX];
-        const isSpatialY = internalYField === 'y_u16';
+        const isSpatialX = internalXField === 'x_u16' || internalXField === 'y_u16';
+        const isSpatialY = internalYField === 'y_u16' || internalYField === 'x_u16';
+
+        const defaultXRange: [number, number] =
+            !isSpatialX && this.xTransform === 'literal'
+                ? [xDomain[0], xDomain[1]]
+                : [rb.minX, rb.maxX];
         // Top-down v0.1 spatial `y_u16` has 0 = max_y (top) and 1 = min_y (bottom);
         // Cartesian data columns have domMin at bottom (minY) unless `flipY: true` (e.g. HR Diagram).
         const defaultYRange: [number, number] = isSpatialY
             ? effFlip
                 ? [rb.minY, rb.maxY]
                 : [rb.maxY, rb.minY]
-            : this.flipY
-              ? [rb.maxY, rb.minY]
-              : [rb.minY, rb.maxY];
+            : this.yTransform === 'literal'
+              ? this.flipY
+                  ? [yDomain[1], yDomain[0]]
+                  : [yDomain[0], yDomain[1]]
+              : this.flipY
+                ? [rb.maxY, rb.minY]
+                : [rb.minY, rb.maxY];
 
         const xRange: [number, number] = this.customXRange
             ? [this.customXRange[0], this.customXRange[1]]
@@ -549,18 +586,15 @@ export class ViewState {
                 : [this.customYRange[0], this.customYRange[1]]
             : defaultYRange;
 
-        const dataXSpan: [number, number] =
-            internalXField === 'x_u16'
-                ? db
-                    ? [db.min_x, db.max_x]
-                    : [rb.minX, rb.maxX]
-                : xDomain;
+        const dataXSpan: [number, number] = isSpatialX
+            ? db
+                ? [db.min_x, db.max_x]
+                : [rb.minX, rb.maxX]
+            : xDomain;
         const dataYSpan: [number, number] = isSpatialY
             ? db
-                ? effFlip
-                    ? [db.min_y, db.max_y]
-                    : [db.max_y, db.min_y]
-                : effFlip
+                ? [db.max_y, db.min_y]
+                : session.summary.isLegacyV00 && effFlip
                   ? [rb.minY, rb.maxY]
                   : [rb.maxY, rb.minY]
             : yDomain;
@@ -722,28 +756,47 @@ export class ViewState {
         }
 
         const mapped = this.resolveAxisMapping(session);
+        const origins = session.colOrigins ?? {};
+        tileStore.colOrigins = { ...origins };
+        const xOrig =
+            mapped.internalXField !== 'x_u16' && mapped.internalXField !== 'y_u16'
+                ? (origins[mapped.internalXField] ?? 0)
+                : 0;
+        const yOrig =
+            mapped.internalYField !== 'y_u16' && mapped.internalYField !== 'x_u16'
+                ? (origins[mapped.internalYField] ?? 0)
+                : 0;
+        const cOrig =
+            this.colorField !== 'x_u16' && this.colorField !== 'y_u16'
+                ? (origins[this.colorField] ?? 0)
+                : 0;
+        const sOrig =
+            this.sizeField !== 'x_u16' && this.sizeField !== 'y_u16'
+                ? (origins[this.sizeField] ?? 0)
+                : 0;
+
         const activeCols = tileStore.updateEncoding(
             {
                 x: {
                     field: mapped.internalXField,
                     transform: this.xTransform,
-                    domain: mapped.xDomain,
+                    domain: [mapped.xDomain[0] - xOrig, mapped.xDomain[1] - xOrig],
                     range: mapped.xRange,
                 },
                 y: {
                     field: mapped.internalYField,
                     transform: this.yTransform,
-                    domain: mapped.yDomain,
+                    domain: [mapped.yDomain[0] - yOrig, mapped.yDomain[1] - yOrig],
                     range: mapped.yRange,
                 },
                 color: {
                     field: this.colorField,
                     range: this.colorScale,
-                    domain: [this.colorMin, this.colorMax],
+                    domain: [this.colorMin - cOrig, this.colorMax - cOrig],
                 },
                 size: {
                     field: this.sizeField,
-                    domain: [this.sizeMin, this.sizeMax],
+                    domain: [this.sizeMin - sOrig, this.sizeMax - sOrig],
                     range: [this.sizeRange[0], this.sizeRange[1]],
                 },
             },

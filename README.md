@@ -2,11 +2,11 @@
 
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/deed.en)
 
-**Deepgraph** is an embeddable, pure-WebGPU billion-point and graph visualization engine for streaming out-of-core **`.arrowtiles` (`v0.1`)** spatial pyramids over HTTP Range requests or local `File` handles.
+**Deepgraph** is an embeddable, pure-WebGPU billion-point and graph visualization engine for streaming out-of-core **`.arrowtiles` (`v0.1`)** spatial pyramids over HTTP Range requests, local `File` handles, or custom `CustomRangeSource` transports.
 
-Built directly on plain WebGPU compute shaders (`0` Three.js / WebGL dependencies, `~46.6 kB` gzipped bundler entry), Deepgraph renders multi-million to billion-row datasets—from **1.8 billion ESA Gaia DR3 stars** to **2.84 million LMSys UMAP chat embeddings**—at interactive frame rates with zero stationary shimmer, instant GPU hover/click picking, smooth 2-second WGSL axis transitions, and deterministic GPU memory teardown.
+Built directly on plain WebGPU compute shaders (`0` Three.js / WebGL dependencies, `0 B` main-thread Arrow parser weight, `~51.0 kB` gzipped bundler entry), Deepgraph renders multi-million to billion-row datasets—verified end-to-end on **`1,348,176,623` ESA Gaia DR3 stars** (`31.81 GiB` archive; `~0.69–0.73s` cold TTFF over `50 ms / 50 Mbps` WAN, `174.8–178.9 FPS` up to `7.22M` active stars on RTX 5090 / `67.4–179.6 FPS` on Intel `xe-lpg` iGPU) and **`2,835,490` LMSys UMAP chat embeddings**—with `0.0000%` stationary shimmer, instant GPU hover/click picking, smooth 2-second WGSL axis transitions, and deterministic GPU memory teardown.
 
-The companion Python + Rust builder, reader, and validator that produces `.arrowtiles` archives lives in the sibling **[arrowtiles](https://github.com/kai-erlenbusch/arrowtiles)** repository (`pip install arrowtiles`).
+The companion Python + Rust builder, reader, validator, and [`1.35B` hardware crucible benchmark](https://github.com/kai-erlenbusch/arrowtiles/blob/main/docs/BENCHMARK_v011_crucible.md) live in the sibling **[arrowtiles](https://github.com/kai-erlenbusch/arrowtiles)** repository (`pip install arrowtiles`).
 
 ---
 
@@ -60,7 +60,8 @@ npm run dev
 npm run build:lib
 npm run verify:types
 
-# Run fast WebGPU Playwright E2E suite (< 5 MiB sample archives from ../arrowtiles/samples/)
+# Run Node.js unit tests (worker IPC codec, 1D RTO & ViewState) + fast WebGPU Playwright E2E suite
+npm run test:unit
 npm run test:e2e
 ```
 
@@ -73,7 +74,7 @@ For contributor architecture rules and WebGPU/packaging invariants, see [`AGENTS
 ## Dataset Showcases
 
 ### ESA Gaia DR3 Sky Catalogue
-- **Scale:** ~1.8 billion stars streamed via HTTP Range requests from `.arrowtiles`
+- **Scale:** `1,348,176,623` local Gaia DR3 stars (`31.81 GiB` `.arrowtiles` `v0.1` archive; designed for the full `1.8B` survey) streamed via HTTP Range requests
 - **Visual Channels:** Galactic Hammer coordinates, `phot_g_mean_mag` / `abs_m` magnitude sizing, additive `R16 / G16 / B16` `bp_rp` optical colour synthesis, HR diagram transitions, and 6D proper-motion star trails
 
 ![Gaia Performance 1](assets/performance_1.png)
@@ -100,7 +101,7 @@ flowchart LR
     E --> F
 ```
 
-1. **`DatasetSession` & `PMTilesClient`:** Validates `.arrowtiles` `v0.1` headers (`0.x` minor-version & `required_features` gates), prefetches PMTiles leaf directories, and decodes Zstd-compressed Arrow IPC tiles across a Web Worker pool (`@bokuweb/zstd-wasm` + `apache-arrow`).
+1. **`DatasetSession` & `PMTilesClient`:** Validates `.arrowtiles` `v0.1` headers (`0.x` minor-version & `required_features` gates), prefetches PMTiles leaf directories, and decodes Zstd-compressed Arrow IPC tiles off-main-thread across a Web Worker pool (`@bokuweb/zstd-wasm` + `@uwdata/flechette`, with `256 MiB` Zstd bomb protection and `1D RTO` `BigInt` precision).
 2. **`TileGpuStore`:** Manages bounded GPU storage-buffer slots with LRU eviction (`GPUBuffer.destroy()` on eviction and `plot.destroy()`) and Float64 relative-to-center (RTC) coordinate uniforms.
 3. **`ComputeRasterizer`:** Commutative, zero-shimmer `2 × u32` atomic WGSL compute splatting across Optical (`R16/G16/B16`), Categorical/Numeric Points (`1,024` levels), Density/Mean-Field KDE, and 6D Star Trails, plus 2-second WGSL axis transitions.
 4. **`PickingLayer` & `HighlightOverlay`:** Sub-millisecond `9×9 CSS px` GPU compute hit-testing with priority-aware tie-breaking, instant `32 B` GPU coordinate hover rings, compressed-tile LRU row decoding (`decode_row`), and opt-in async `resolveRowAttributes` sidecar enrichment.

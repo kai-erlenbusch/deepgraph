@@ -5,16 +5,17 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * Vite ES-Module Library Build (`Phase 8 / 8c — Bundler Entry dist/index.js`).
+ * Vite ES-Module Library Build (`v0.1.1 — Bundler Entry dist/index.js`).
  *
- * - Externalizes main-thread runtime dependencies (`pmtiles`, `p-queue`, `fflate`, `apache-arrow`,
+ * - Externalizes runtime dependencies (`pmtiles`, `p-queue`, `fflate`, `@uwdata/flechette`,
  *   `@bokuweb/zstd-wasm`) so downstream Vite / Rollup / Webpack / esbuild consumers deduplicate
- *   shared packages cleanly instead of bundling duplicate copies of `apache-arrow`.
+ *   shared packages cleanly with `0 B` main-thread Arrow parser weight.
  * - Keeps the Web Worker chunk (`dist/assets/pmtiles.worker-*.js`) 100% self-contained
- *   (`worker.rollupOptions.external = []`) with inlined base64 `zstd.wasm` and relative
- *   `new URL("assets/pmtiles.worker-*.js", import.meta.url)` resolution so consumers need zero
- *   worker/WASM bundler plugins.
- * - For zero-build `<script type="module">` HTML pages, see `vite.standalone.config.ts` (`dist/standalone.js`).
+ *   (`worker.rollupOptions.external = []`) with `@uwdata/flechette` (`~20 KiB`) + inlined base64
+ *   `zstd.wasm` and relative `new URL("assets/pmtiles.worker-*.js", import.meta.url)` resolution
+ *   so consumers need zero worker/WASM bundler plugins.
+ * - For zero-build `<script type="module">`, `anywidget`, or `blob:` embeds, see
+ *   `vite.standalone.config.ts` (`dist/standalone.js`).
  */
 export default defineConfig({
     base: './',
@@ -40,12 +41,12 @@ export default defineConfig({
                 'pmtiles',
                 'p-queue',
                 'fflate',
-                'apache-arrow',
+                '@uwdata/flechette',
                 '@bokuweb/zstd-wasm',
                 /^pmtiles\//,
                 /^p-queue\//,
                 /^fflate\//,
-                /^apache-arrow\//,
+                /^@uwdata\/flechette\//,
                 /^@bokuweb\/zstd-wasm\//,
             ],
         },

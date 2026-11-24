@@ -37,8 +37,9 @@ export class Renderer {
     public canvasFormat: GPUTextureFormat = 'bgra8unorm';
 
     public dpr = 1.0;
+    public baseZoom = 1.0;
     public zoomT = 0.0;
-    /** Continuous unclamped `max(0, log2(camera.zoom))` for multiscale deep-zoom sizing & exposure (`Phase 8b`). */
+    /** Continuous unclamped `max(0, log2(camera.zoom / baseZoom))` for multiscale deep-zoom sizing & exposure (`Phase 8b`). */
     public logZoom = 0.0;
     public worldUnitsPerPixel = 0.001;
 
@@ -168,6 +169,9 @@ export class Renderer {
             if (lim.maxBufferSize) {
                 requiredLimits.maxBufferSize = lim.maxBufferSize;
             }
+            if (lim.maxTextureDimension2D) {
+                requiredLimits.maxTextureDimension2D = lim.maxTextureDimension2D;
+            }
         }
 
         const device = await adapter.requestDevice({ requiredLimits });
@@ -206,11 +210,22 @@ export class Renderer {
         return { width: Math.max(1, w), height: Math.max(1, h) };
     }
 
+    public setBaseZoom(next: number): void {
+        this.baseZoom = Number.isFinite(next) && next > 0 ? next : 1.0;
+    }
+
+    public clampZoom(zoom: number): number {
+        const minZ = MIN_ZOOM * this.baseZoom;
+        const maxZ = MAX_ZOOM * this.baseZoom;
+        return Math.min(maxZ, Math.max(minZ, zoom));
+    }
+
     private syncCanvasDimensions(cssWidth: number, cssHeight: number): void {
         const dpr = Math.max(1, window.devicePixelRatio || 1);
         this.dpr = dpr;
-        const backingW = Math.max(1, Math.floor(cssWidth * dpr));
-        const backingH = Math.max(1, Math.floor(cssHeight * dpr));
+        const maxDim = this.device?.limits?.maxTextureDimension2D ?? 8192;
+        const backingW = Math.min(maxDim, Math.max(1, Math.floor(cssWidth * dpr)));
+        const backingH = Math.min(maxDim, Math.max(1, Math.floor(cssHeight * dpr)));
 
         this.canvas.style.width = `${cssWidth}px`;
         this.canvas.style.height = `${cssHeight}px`;
@@ -334,10 +349,11 @@ export class Renderer {
     private onWheel(event: WheelEvent): void {
         if (this.disposed) return;
         event.preventDefault();
+        event.stopPropagation();
 
         const zoomFactor = event.deltaY > 0 ? 1.1 : 0.9;
         const prevZoom = this.camera.zoom;
-        const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, prevZoom / zoomFactor));
+        const nextZoom = this.clampZoom(prevZoom / zoomFactor);
         if (nextZoom === prevZoom) return;
 
         const rect = this.canvas.getBoundingClientRect();
@@ -365,7 +381,8 @@ export class Renderer {
         const visibleHeight = (this.camera.top - this.camera.bottom) / this.camera.zoom;
         this.worldUnitsPerPixel = visibleHeight / height;
         this.dpr = Math.max(1, window.devicePixelRatio || 1);
-        const currentZoom = Math.log2(Math.max(0.1, this.camera.zoom));
+        const relZoom = this.camera.zoom / Math.max(1e-30, this.baseZoom);
+        const currentZoom = Math.log2(Math.max(0.1, relZoom));
         this.logZoom = Math.max(0.0, currentZoom);
         this.zoomT = Math.max(0.0, Math.min(1.0, currentZoom / 6.0));
     }

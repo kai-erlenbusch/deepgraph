@@ -1,8 +1,8 @@
-# Deepgraph Public JavaScript / TypeScript API (`v0.1 — Phase 8 / D11`)
+# Deepgraph Public JavaScript / TypeScript API (`v0.1.1`)
 
-> **Status:** `v0.1.0` (`npm install deepgraph`; license: `CC-BY-NC-4.0` + commercial license via `erlenbusch@uchicago.edu`).
+> **Status:** `v0.1.1` (`npm install deepgraph`; license: `CC-BY-NC-4.0` + commercial license via `erlenbusch@uchicago.edu`).
 
-`Deepgraph` is an embeddable WebGPU compute scatterplot & spatial-pyramid library for streaming multi-million to billion-point **`.arrowtiles` (`v0.1`)** archives over HTTP Range requests or local `File` handles.
+`Deepgraph` is an embeddable WebGPU compute scatterplot & spatial-pyramid library for streaming multi-million to billion-point **`.arrowtiles` (`v0.1`)** archives over HTTP Range requests, local `File` handles, or custom byte-range transports (`CustomRangeSource`).
 
 The core library exports **only** `Deepgraph` (`create`, `isSupported`) and pure TypeScript interfaces from `src/index.ts`. It has **zero dependency on `lil-gui`**, never reads `window.location` or URL query parameters, never mutates DOM elements outside the host `container` element passed to `Deepgraph.create(...)`, and keeps all domain-specific extensions cleanly isolated behind optional `preset` / `experimental` configuration.
 
@@ -33,7 +33,7 @@ const plot = await Deepgraph.create(container, {
 plot.setEncoding({ x: 'num_of_tokens', y: 'turn', color: 'model' });
 plot.setEncoding({ x: null, y: null });
 
-// Subscribe to point interactions (GPU PickingLayer lands in Phase 7) & frame telemetry
+// Subscribe to point interactions (9x9 CSS px GPU PickingLayer) & frame telemetry
 const offClick = plot.on('click', (hit) => {
   if (!hit) return;
   console.log('Clicked row_id:', hit.rowId, hit.attributes);
@@ -57,21 +57,35 @@ Synchronously checks whether `navigator.gpu` is available in the current browser
 Creates a WebGPU canvas inside `container` (which **should have explicit non-zero CSS `width` and `height`**, observed automatically via `ResizeObserver`), initializes the Web Worker pool, and optionally loads an initial `.arrowtiles` source. If `options.url` fails validation, `create()` automatically cleans up all allocated resources before rejecting.
 
 ```ts
+interface CustomRangeSource {
+  key?: string;
+  getKey?(): string;
+  maxLeafPrefetchBytes?: number;
+  getBytes(
+    offset: number,
+    length: number,
+    signal?: AbortSignal,
+    etag?: string
+  ): Promise<{ data: ArrayBuffer; etag?: string; cacheControl?: string; expires?: string }>;
+}
+
+type TileSource = string | File | CustomRangeSource;
+
 type DeepgraphPresetResolver = (
   rawMetadata: Record<string, unknown>,
-  source: string | File
+  source: TileSource
 ) => DeepgraphPreset | undefined;
 
 interface DeepgraphOptions {
-  /** Optional initial `.arrowtiles` URL (HTTP Range server / CDN) or browser `File` object. */
-  url?: string | File;
+  /** Optional initial `.arrowtiles` URL, browser `File`, or `CustomRangeSource` transport. */
+  url?: TileSource;
   /** Initial visual channel encoding (overrides archive `metadata.view` defaults). */
   encoding?: DeepgraphEncoding;
   /** Optional domain preset object OR `(rawMetadata, source) => DeepgraphPreset | undefined` resolver. */
   preset?: DeepgraphPreset | DeepgraphPresetResolver;
   /** Quadtree Z-level overfetch offset relative to `floor(log2(zoom))` (default: `2`). */
   detailOffset?: number;
-  /** Maximum decoded tiles retained in the client LRU cache (default: `250`). */
+  /** Maximum decoded tiles retained in the client LRU cache (default: `250`, clamped to `>= 32`). */
   maxTileCache?: number;
   /** WebGPU adapter power preference (`'high-performance'` default, or `'low-power'` to prefer integrated GPUs). */
   powerPreference?: 'high-performance' | 'low-power';
@@ -102,8 +116,8 @@ interface DeepgraphOptions {
 
 - **Spatial Coordinates by Default:** Omitting `x` and `y` on `create()` / `load()` uses the archive's built-in spatial quadtree coordinates. Calling `plot.setEncoding({ x: null, y: null })` transitions any custom chart axis back to spatial positions without exposing internal tile column names.
 - **Multiscale Zoom-Adaptive Density & Optical RGB / Log-Density Resolve (`Phase 8b`):**
-  - **Optical Sky & Trails (`pipeline: 'optical'` / `'trails'`):** Evaluates per-star optical RGB (`three_aces_filmic` + `linear_to_srgb`) and accumulates 16-bit integer channels (`word0 = R16 | (G16 << 16)`, `word1 = B16`, scale `1.0 = 1024.0`, `64×` headroom before `65535` wrap) resolved via `min(ch, 1024u) / 1024.0` (`0.0000%` stationary shimmer, natural additive blue+gold star mixing, and incandescent white-gold bulge blooming).
-  - **Log-Density Points (`'points'` / `D10`):** Both categorical and generic numeric `'points'` modes accumulate into the same `2 × u32` compute buffer and resolve via `log2(1 + count)` brightness with a continuous zoom-adaptive `refCount` (`96 → 1.15` across `Z=0..12+`): categorical Mode 1 averages the RGB of the first 64 weighted hits per pixel (`64 × 15 < 1024`), while numeric Mode 1 accumulates an order-independent `1,024`-level normalized value sum (`word1 = Σ(tU * wVal)`, `prevW < 1,048,576`) and evaluates the colormap on the exact mean scalar in Resolve (`0.0000%` stationary shimmer, `1,024` levels, preventing dense cores from saturating to white).
+  - **Optical Sky & Trails (`pipeline: 'optical'` / `'trails'`):** Evaluates per-star optical RGB (`three_aces_filmic` + `linear_to_srgb`) and accumulates 16-bit integer channels (`word0 = R16 | (G16 << 16)`, `word1 = B16 | (fluxTickets16 << 16)`, scale `1.0 = 1024.0`, flux-proportional atomic ticket `ceil(max(rU, gU, bU) / 16) <= 3,840` preventing `R16->G16/B16` carry across up to `3,840` faint stars/pixel) resolved via `min(ch, 1024u) / 1024.0` (`0.0000%` stationary shimmer, natural additive blue+gold star mixing, and incandescent white-gold bulge blooming).
+  - **Log-Density Points (`'points'` / `D10`):** Both categorical and generic numeric `'points'` modes accumulate into the same `2 × u32` compute buffer and resolve via `log2(1 + count)` brightness with a continuous zoom-adaptive `refCount` (`96 → 1.15` across `Z=0..12+`): categorical Mode 1 packs `word0 = rSum_u16 | (wRgbSum_u16 << 16)` and `word1 = gSum_u16 | (bSum_u16 << 16)` (`Q = 12.0`, `64/64` unique palette colors, `wRgbSum < 5,120` = `2,560` center hits with `0.0000%` shimmer), while numeric Mode 1 accumulates an order-independent `1,024`-level normalized value sum (`word1 = Σ(tU * wVal)`, `prevW < 1,048,576`) and evaluates the colormap on the exact mean scalar in Resolve (`0.0000%` stationary shimmer, `1,024` levels, preventing dense cores from saturating to white).
   - **Continuous Log-Zoom Point Sizing & `'auto'` Exposure/Opacity Semantics:** Rendered point diameter scales smoothly past `zoom = 64` via `pointSize` (`1.0` default) and `zoomBalance` (`0.22` default). When `exposure: 'auto'` or `pointOpacity: 'auto'` is active, gain follows a deterministic `log2(zoom)` curve — preserving the baseline optical exposure/opacity across `Z=0..7` (`zoom <= 36`) and ramping exposure smoothly above `zoom > 36` so deep-zoom starfields (`Z >= 8`) and faint extragalactic overdensities remain crisp without pan-induced brightness pumping.
 
 ```ts
@@ -164,7 +178,7 @@ interface DeepgraphEncoding {
 
 | Method | Signature | Description |
 | :--- | :--- | :--- |
-| **`load`** | `load(source: string \| File, opts?: LoadDatasetOptions): Promise<DatasetMetadataSummary>` | Disposes previous dataset GPU buffers, validates the `.arrowtiles` (`v0.1` or legacy `v0.0`) archive using a single `PMTiles` instance and monotonic load-generation token (rejecting superseded in-flight loads with `DOMException(..., 'AbortError')`), resolves `opts.preset`, and streams active columns lazily. |
+| **`load`** | `load(source: TileSource, opts?: LoadDatasetOptions): Promise<DatasetMetadataSummary>` | Disposes previous dataset GPU buffers, validates the `.arrowtiles` (`v0.1` or legacy `v0.0`) archive using a single `PMTiles` instance and monotonic load-generation token (rejecting superseded in-flight loads with `DOMException(..., 'AbortError')`), resolves `opts.preset`, and streams active columns lazily. |
 | **`setEncoding`** | `setEncoding(encoding: DeepgraphEncoding): void` | Updates visual channel mappings, axis/color/size domains, `flipY`, or aggregation mode. Axis changes animate smoothly over 2 seconds in WGSL; domain/scale tweaks apply in `0 ms` via GPU uniforms. |
 | **`getEncoding`** | `getEncoding(): DeepgraphEncoding` | Returns a copy of the active declarative encoding. |
 | **`setViewOptions`** | `setViewOptions(patch: ViewOptionsPatch): void` | Low-level shader, multiscale (`pointSize`, `zoomBalance`, `pointOpacity`, `exposure`), `detailOffset`, and `experimental` controls. |
@@ -222,8 +236,8 @@ const skySurveyPreset: DeepgraphPreset = {
 ### Package Entry Points (`package.json`)
 
 - **`"exports"`:**
-  - **`"."`** (`import { Deepgraph } from 'deepgraph'`): `{ "types": "./dist/index.d.ts", "import": "./dist/index.js" }` — **Bundler entry** externalizing main-thread runtime dependencies (`pmtiles`, `p-queue`, `fflate`, `apache-arrow`, `@bokuweb/zstd-wasm`) so Vite / Rollup / Webpack / esbuild consumers deduplicate shared packages cleanly while keeping `dist/assets/pmtiles.worker-*.js` + base64 `zstd.wasm` self-contained.
-  - **`"./standalone"`** (`import { Deepgraph } from 'deepgraph/standalone'`): `{ "types": "./dist/index.d.ts", "import": "./dist/standalone.js" }` — **Zero-build standalone entry** bundling all runtime dependencies for direct `<script type="module">` HTML pages (see [`examples/embed.html`](../examples/embed.html)).
+  - **`"."`** (`import { Deepgraph } from 'deepgraph'`): `{ "types": "./dist/index.d.ts", "import": "./dist/index.js" }` — **Bundler entry** externalizing main-thread runtime dependencies (`pmtiles`, `p-queue`, `fflate`, `@uwdata/flechette`, `@bokuweb/zstd-wasm`) with **`0 B` main-thread Arrow parser weight** while keeping `dist/assets/pmtiles.worker-*.js` (`@uwdata/flechette` + base64 `zstd.wasm`) self-contained.
+  - **`"./standalone"`** (`import { Deepgraph } from 'deepgraph/standalone'`): `{ "types": "./dist/index.d.ts", "import": "./dist/standalone.js" }` — **Single-file zero-build standalone entry** bundling all runtime dependencies AND inlining the Web Worker as a cached `Blob` URL (`URL.createObjectURL`), working directly from `<script type="module">` HTML pages ([`examples/embed.html`](../examples/embed.html)), `blob:` URLs, `esm.sh`, and Jupyter `anywidget` notebooks.
 - **`"main"` / `"module"`:** `"./dist/index.js"` (`"type": "module"`, `"sideEffects": false`)
 - **`"types"`:** `"./dist/index.d.ts"` (emitted with `"rootDir": "./src"` and `"stripInternal": true`, rewritten to `.js` relative specifiers so standard downstream TypeScript projects pass `tsc --noEmit` under both `bundler` and `nodenext` without `allowImportingTsExtensions` or `@webgpu/types`)
 - **`"license"`:** `"CC-BY-NC-4.0"` (free for non-commercial use; commercial use requires a separate license via `erlenbusch@uchicago.edu` — see `LICENSE` and `NOTICE`; `"name": "deepgraph"`, `"files": ["dist", "docs/API.md", "LICENSE", "NOTICE"]`)
@@ -232,16 +246,17 @@ const skySurveyPreset: DeepgraphPreset = {
 
 | Script | Output / Check |
 | :--- | :--- |
-| `npm run build` / `npm run build:lib` | Builds both the externalized bundler entry (`dist/index.js`) and the self-contained browser entry (`dist/standalone.js`) plus self-contained `dist/assets/pmtiles.worker-*.js` (`copyPublicDir: false`), and emits clean TypeScript declarations (`dist/index.d.ts`, `dist/lib/types.d.ts`). |
-| `npm run verify:types` | Runs external consumer `tsc --noEmit` under both `"moduleResolution": "bundler"` and `"moduleResolution": "nodenext"` (`allowImportingTsExtensions` disabled, `skipLibCheck: false`, `types: []`, testing both `"."` and `"./standalone"`) **plus** a real `vite build` consumer application importing `dist/index.js` alongside `apache-arrow`. |
+| `npm run build` / `npm run build:lib` | Builds both the externalized bundler entry (`dist/index.js` + self-contained `dist/assets/pmtiles.worker-*.js`) and the single-file standalone entry (`dist/standalone.js` with cached `Blob` worker), and emits clean TypeScript declarations (`dist/index.d.ts`, `dist/lib/types.d.ts`). |
+| `npm run verify:types` | Runs external consumer `tsc --noEmit` under both `"moduleResolution": "bundler"` and `"moduleResolution": "nodenext"` (`allowImportingTsExtensions` disabled, `skipLibCheck: false`, `types: []`, testing both `"."` and `"./standalone"`) **plus** a real `vite build` consumer application importing `dist/index.js` alongside `@uwdata/flechette`. |
+| `npm run test:unit` | Runs fast Node.js (`node:test`) unit tests covering `@uwdata/flechette` worker IPC codecs (`Utf8View`, `Decimal128`, `Timestamp`, `Date32`, `Float16`, `Dictionary`, `BigInt > 2^53-1`, `1D RTO` `colOrigins`, Zstd bomb rejection) and `ViewState` / `DatasetSession` invariants. |
 | `npm run build:demo` | Builds the standalone interactive `lil-gui` demo application into `dist-demo/` (`copyPublicDir: false`). |
 | `npm run test:e2e` | Runs the 3 fast Playwright WebGPU specs (`library-embed`, `phase8b-hdr-density`, `picking-layer`) against `< 5 MiB` sample archives in sibling `../arrowtiles/samples/`. |
-| `npm run test:e2e:heavy` | Runs the 5-gate VRAM & LRU lifecycle stress suite (`gpu-vram-lifecycle.spec.ts`) against local `public/gaia_full.arrowtiles` and `../arrowtiles/samples/lmsys_d7_proportional_25k.arrowtiles`. |
+| `npm run test:e2e:heavy` | Runs the 5-gate VRAM & LRU lifecycle stress suite (`gpu-vram-lifecycle.spec.ts`) against local `public/gaia_full.arrowtiles` (or `DEEPGRAPH_GAIA_FILE`) and `../arrowtiles/samples/lmsys_d7_proportional_25k.arrowtiles`. |
 
 ### Bundled vs. Externalized Dependencies & Zero-Config Worker / WASM Loading
 
 - **Zero Demo Dependencies in `dist/`:** `lil-gui` (`MIT`) is a `devDependency` used exclusively by `src/demo/` (`0 B` in `dist/`).
-- **Clean Bundler Deduplication (`dist/index.js`) + Zero-Build Standalone (`dist/standalone.js`):** Downstream bundlers consume `dist/index.js` and share `pmtiles` (`BSD-3-Clause`), `p-queue` (`MIT`), `fflate` (`MIT`), `apache-arrow` (`Apache-2.0`), and `@bokuweb/zstd-wasm` (`MIT`) from `node_modules` without duplicating `apache-arrow` on the main thread, while zero-build HTML pages import `dist/standalone.js`.
-- **Self-Contained Relative Worker + Inlined `zstd.wasm` (Both Builds):**
-  1. Both `dist/index.js` and `dist/standalone.js` instantiate their Web Worker pool via `new Worker(new URL("assets/pmtiles.worker-*.js", import.meta.url), { type: "module" })` — always resolved relative to `dist/` rather than the host page's root URL.
-  2. `dist/assets/pmtiles.worker-*.js` stays 100% self-contained in both builds (`0` bare module specifiers) and embeds `@bokuweb/zstd-wasm`'s `zstd.wasm` binary as an inline `data:application/wasm;base64,...` URI so consumers never hit broken `/assets/*.wasm` 404s or need custom worker/WASM bundler plugins.
+- **Clean Bundler Deduplication (`dist/index.js`) + Single-File Standalone (`dist/standalone.js`):** Downstream bundlers consume `dist/index.js` (`pmtiles` `BSD-3-Clause`, `p-queue` `MIT`, `fflate` `MIT`, `@uwdata/flechette` `BSD-3-Clause`, `@bokuweb/zstd-wasm` `MIT`) with zero main-thread Arrow parser weight, while zero-build HTML pages, CDNs, and `anywidget` notebooks import `dist/standalone.js`.
+- **Self-Contained Worker + Inlined `zstd.wasm`:**
+  1. `dist/index.js` instantiates its Web Worker pool via `new Worker(new URL("assets/pmtiles.worker-*.js", import.meta.url), { type: "module" })` (`0` bare specifiers, inlined `data:application/wasm;base64,...` `zstd.wasm`), while `dist/standalone.js` inlines that worker directly as a cached `Blob` URL (`0` secondary network asset fetches).
+  2. Consumers never hit broken `/assets/*.wasm` 404s or need custom worker/WASM bundler plugins.

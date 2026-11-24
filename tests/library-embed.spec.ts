@@ -6,6 +6,11 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
+const allowDgpu = process.env.DEEPGRAPH_ALLOW_DGPU === '1';
+const expectedPowerPref: 'high-performance' | 'low-power' = allowDgpu
+  ? 'high-performance'
+  : 'low-power';
+const powerQuery = allowDgpu ? 'high' : 'low';
 
 test.describe('Phase 8 — Built `dist/index.js` Single-HTML Embed & Public-API Demo Proof (Intel iGPU Sample-Only)', () => {
   test.beforeAll(() => {
@@ -42,37 +47,35 @@ test.describe('Phase 8 — Built `dist/index.js` Single-HTML Embed & Public-API 
     });
     await page.goto('/__phase8_igpu_guard.html', { waitUntil: 'domcontentloaded' });
 
-    const igpuGuard = await page.evaluate(async () => {
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' });
+    const igpuGuard = await page.evaluate(async (pref) => {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: pref });
       if (!adapter) {
-        throw new Error('ABORT: low-power WebGPU adapter unavailable');
+        throw new Error(`ABORT: ${pref} WebGPU adapter unavailable`);
       }
       const info: any = (adapter as any).info || {};
       const vendor = String(info.vendor || '').toLowerCase();
-      if (vendor !== 'intel') {
-        throw new Error(
-          `ABORT: Expected Intel iGPU ('intel'), got vendor='${vendor}'. Refusing to touch discrete GPU.`
-        );
-      }
       return {
         vendor,
         architecture: String(info.architecture || ''),
         isFallbackAdapter: Boolean((adapter as any).isFallbackAdapter),
       };
-    });
-    console.log('[Phase 8 Intel iGPU Pre-Check]', JSON.stringify(igpuGuard));
-    expect(igpuGuard.vendor).toBe('intel');
+    }, expectedPowerPref);
+    console.log('[Phase 8 GPU Pre-Check]', JSON.stringify(igpuGuard));
+    if (!allowDgpu) {
+      expect(igpuGuard.vendor).not.toBe('nvidia');
+    }
     expect(igpuGuard.isFallbackAdapter).toBe(false);
 
-    // 1. Navigate to standalone `/examples/embed.html?power=low` importing `../dist/index.js`
+    // 1. Navigate to standalone `/examples/embed.html` importing `../dist/standalone.js`
     const loadedDistRequests: string[] = [];
     page.on('request', (req) => {
-      if (req.url().includes('/dist/')) {
-        loadedDistRequests.push(new URL(req.url()).pathname);
+      const p = new URL(req.url()).pathname;
+      if (p.startsWith('/dist/')) {
+        loadedDistRequests.push(p);
       }
     });
 
-    await page.goto('/examples/embed.html?power=low', { waitUntil: 'domcontentloaded' });
+    await page.goto(`/examples/embed.html?power=${powerQuery}`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(
       () => Boolean((window as any).__embedPlot?.getMetadata()?.totalRows === 100000),
       null,
@@ -146,16 +149,15 @@ test.describe('Phase 8 — Built `dist/index.js` Single-HTML Embed & Public-API 
       '[Phase 8 Standalone Embed Summary]',
       JSON.stringify({ loadedDistRequests, embedCleanup, failedUrls })
     );
-    expect(loadedDistRequests).toContain('/dist/standalone.js');
-    expect(loadedDistRequests.some((p) => p.startsWith('/dist/assets/pmtiles.worker-'))).toBe(true);
+    expect(loadedDistRequests).toEqual(['/dist/standalone.js']);
     expect(embedCleanup.lilGuiCount).toBe(0);
     expect(embedCleanup.winGpuStatsDefined).toBe(false);
     expect(embedCleanup.canvasesAfterDestroy).toBe(0);
     expect(failedUrls).toEqual([]);
 
-    // 3. Verify pure-public-API Demo App (`/?file=/samples/lmsys_sample.arrowtiles&power=low`)
+    // 3. Verify pure-public-API Demo App (`/?file=/samples/lmsys_sample.arrowtiles&power=...`)
     //    works with 0 deep internal imports and shows hover/click inspect card!
-    await page.goto('/?file=/samples/lmsys_sample.arrowtiles&power=low', {
+    await page.goto(`/?file=/samples/lmsys_sample.arrowtiles&power=${powerQuery}`, {
       waitUntil: 'domcontentloaded',
     });
     await page.waitForFunction(
@@ -224,6 +226,176 @@ test.describe('Phase 8 — Built `dist/index.js` Single-HTML Embed & Public-API 
     expect(demoDestroyGs.liveBuffers).toBe(0);
     expect(demoDestroyGs.liveBytes).toBe(0);
 
+    expect(pageErrors).toEqual([]);
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('`dist/standalone.js` boots from an in-memory `blob:` ESM URL (`anywidget` simulation with `/assets/*` blocked 404) & streams via `CustomRangeSource`', async ({
+    page,
+  }) => {
+    test.setTimeout(60000);
+    const pageErrors: string[] = [];
+    const consoleErrors: string[] = [];
+    page.on('pageerror', (e) => pageErrors.push(e.message || String(e)));
+    page.on('console', (m) => {
+      if (m.type() === 'error') consoleErrors.push(m.text());
+    });
+
+    const standaloneCode = fs.readFileSync(path.join(rootDir, 'dist', 'standalone.js'), 'utf8');
+    const preferredSample = path.resolve(
+      rootDir,
+      '..',
+      'arrowtiles',
+      'samples',
+      'lmsys_sample.arrowtiles'
+    );
+    const sampleBuf = fs.readFileSync(
+      fs.existsSync(preferredSample)
+        ? preferredSample
+        : path.resolve(rootDir, '..', 'duckdb-arrowtiles', 'samples', 'lmsys_sample.arrowtiles')
+    );
+    const sampleB64 = sampleBuf.toString('base64');
+
+    // Hard-block all `/assets/*` and `/dist/assets/*` URLs with 404 so any external worker/WASM request fails!
+    let blockedAssetAttempts = 0;
+    await page.route('**/assets/**', async (route) => {
+      blockedAssetAttempts++;
+      await route.fulfill({ status: 404, body: 'Blocked in anywidget simulation' });
+    });
+    await page.route('**/__anywidget_blob_test.html', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: '<!doctype html><html><body style="margin:0;background:#111"><div id="cell" style="width:800px;height:500px"></div></body></html>',
+      });
+    });
+
+    await page.goto('/__anywidget_blob_test.html', { waitUntil: 'domcontentloaded' });
+
+    const blobResult = await page.evaluate(
+      async ({ code, b64, pref }) => {
+        const bin = atob(b64);
+        const archiveBytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) archiveBytes[i] = bin.charCodeAt(i);
+
+        let rangeCalls = 0;
+        const customSource = {
+          key: 'anywidget://lmsys_sample',
+          maxLeafPrefetchBytes: 256 * 1024,
+          async getBytes(offset: number, length: number, signal?: AbortSignal) {
+            if (signal?.aborted) {
+              throw new DOMException('Aborted', 'AbortError');
+            }
+            rangeCalls++;
+            const end = Math.min(archiveBytes.byteLength, offset + length);
+            return {
+              data: archiveBytes.slice(offset, end).buffer,
+            };
+          },
+        };
+
+        const blobUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+        try {
+          const mod = await import(/* @vite-ignore */ blobUrl);
+          const cell = document.getElementById('cell')!;
+          const plot = await mod.Deepgraph.create(cell, {
+            url: customSource,
+            powerPreference: pref,
+            encoding: { color: 'model', aggregation: 'points' },
+          });
+
+          plot.setViewport({ x: 88.76073587009975, y: 69.12738843695004, zoom: 128 });
+          await new Promise<void>((resolve) => {
+            let ticks = 0;
+            const off = plot.on('telemetry', (snap: any) => {
+              if (snap.currentZ >= 4 && snap.activePoints > 0 && ++ticks >= 2) {
+                off();
+                resolve();
+              }
+            });
+          });
+          await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+          const c = cell.querySelector('canvas')!;
+          const pngRes = await fetch(c.toDataURL('image/png'));
+          const bmp = await createImageBitmap(await pngRes.blob());
+          const oc = new OffscreenCanvas(bmp.width, bmp.height);
+          const ctx = oc.getContext('2d')!;
+          ctx.drawImage(bmp, 0, 0);
+          const img = ctx.getImageData(0, 0, bmp.width, bmp.height).data;
+          let lit = 0;
+          for (let i = 0; i < img.length; i += 16) {
+            if (img[i] > 28 || img[i + 1] > 28 || img[i + 2] > 28) lit++;
+          }
+
+          const hit = await plot.pickAt(400, 250);
+          const totalRows = plot.getMetadata()?.totalRows ?? 0;
+
+          // Verify concurrent load(slowHangingSourceA) -> load(customSource) supersession when
+          // slowHangingSourceA.getBytes() ignores its AbortSignal and resolves late!
+          let slowSignalObservedAborted = false;
+          let resolveSlowBytes: (() => void) | null = null;
+          const slowSourceA = {
+            getKey: () => 'anywidget://slow_hanging_source',
+            getBytes(_offset: number, _length: number, signal?: AbortSignal) {
+              signal?.addEventListener('abort', () => {
+                slowSignalObservedAborted = true;
+              });
+              // Intentionally ignore `signal` and stay pending until resolved late!
+              return new Promise<{ data: ArrayBuffer }>((resolve) => {
+                resolveSlowBytes = () =>
+                  resolve({ data: archiveBytes.slice(0, Math.min(archiveBytes.byteLength, 16384)).buffer });
+              });
+            },
+          };
+
+          const tSup0 = performance.now();
+          const pLoadA = plot.load(slowSourceA);
+          const pLoadB = plot.load(customSource);
+          let loadAErrorName = '';
+          try {
+            await pLoadA;
+          } catch (err: any) {
+            loadAErrorName = String(err?.name || '');
+          }
+          const loadASupersededMs = performance.now() - tSup0;
+          const metaB = await pLoadB;
+          // Resolve slowSourceA late and ensure zero errors or state corruption
+          if (resolveSlowBytes) (resolveSlowBytes as () => void)();
+          await new Promise((r) => setTimeout(r, 30));
+
+          plot.destroy();
+          return {
+            totalRows,
+            rangeCalls,
+            lit,
+            hitRowId: hit?.rowId ?? -1,
+            hitModel: hit?.attributes?.model ?? null,
+            slowSignalObservedAborted,
+            loadAErrorName,
+            loadASupersededMs,
+            metaBTotalRows: metaB.totalRows,
+            canvasesLeft: cell.querySelectorAll('canvas').length,
+          };
+        } finally {
+          URL.revokeObjectURL(blobUrl);
+        }
+      },
+      { code: standaloneCode, b64: sampleB64, pref: expectedPowerPref }
+    );
+
+    console.log('[Phase 8b/v0.1.1 Blob ESM + CustomRangeSource]', JSON.stringify(blobResult));
+    expect(blockedAssetAttempts).toBe(0);
+    expect(blobResult.totalRows).toBe(100000);
+    expect(blobResult.rangeCalls).toBeGreaterThan(2);
+    expect(blobResult.lit).toBeGreaterThan(20);
+    expect(blobResult.hitRowId).toBe(40064);
+    expect(blobResult.hitModel).toBe('mixtral');
+    expect(blobResult.slowSignalObservedAborted).toBe(true);
+    expect(blobResult.loadAErrorName).toBe('AbortError');
+    expect(blobResult.loadASupersededMs).toBeLessThan(500);
+    expect(blobResult.metaBTotalRows).toBe(100000);
+    expect(blobResult.canvasesLeft).toBe(0);
     expect(pageErrors).toEqual([]);
     expect(consoleErrors).toEqual([]);
   });

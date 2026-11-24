@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    environment: npm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Ensure npm >= 11.5.1 for OIDC Trusted Publishing
+        run: |
+          NPM_VER="$(npm --version)"
+          echo "Detected npm ${NPM_VER}"
+          node -e '
+            const [maj, min, pat] = process.argv[1].split(".").map((n) => parseInt(n, 10));
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            process.exit(ok ? 0 : 1);
+          ' "${NPM_VER}" || npm install -g "npm@^11.5.1"
+          npm --version
+
+      - name: Install dependencies (deterministic lockfile)
+        run: npm ci
+
+      - name: Typecheck source & unit tests
+        run: npm run typecheck
+
+      - name: Build bundler & standalone library bundles + declarations
+        run: npm run build:lib
+
+      - name: Verify external consumer TypeScript & Vite app build
+        run: npm run verify:types
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Publish to npm via OIDC Trusted Publishing
+        run: npm publish --provenance --access public --loglevel verbose
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --generate-notes

@@ -227,6 +227,6 @@ export default defineConfig({
     }
   },
   optimizeDeps: {
-    exclude: ['apache-arrow', 'pmtiles', 'lil-gui']
+    exclude: ['@uwdata/flechette', 'pmtiles', 'lil-gui']
   }
 });

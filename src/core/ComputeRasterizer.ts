@@ -409,6 +409,25 @@ fn map_linear(val: f32, domMin: f32, domMax: f32, rangeMin: f32, rangeMax: f32) 
     return mix(rangeMin, rangeMax, t);
 }
 
+fn project_non_spatial_rtc(
+    val: f32,
+    domMin: f32,
+    domMax: f32,
+    rtcAnchor: f32,
+    rtcScale: f32,
+    isLiteral: bool
+) -> f32 {
+    let effVal = select(
+        clamp(val, min(domMin, domMax), max(domMin, domMax)),
+        val,
+        isLiteral
+    );
+    if (rtcScale == 0.0) {
+        return rtcAnchor;
+    }
+    return (effVal - rtcAnchor) * rtcScale;
+}
+
 fn icrs_pm_to_gal_vel(l: f32, b: f32, pmra: f32, pmdec: f32, out_uGal: ptr<function, vec3<f32>>) -> vec3<f32> {
     let cosB = cos(b);
     let uGal = vec3<f32>(cosB * cos(l), cosB * sin(l), sin(b));
@@ -556,7 +575,10 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
 }
 
 // Modes 0 & 3 (Optical Sky & Star Trails — D10):
-// 16-bit channels in 2 x u32 (word0 = R16 | G16<<16, word1 = B16), scale 1.0 = 1024.0 (64x headroom before 65535 -> 0.0000% shimmer)
+// 16-bit channels in 2 x u32 (word0 = R16 | G16<<16, word1 = B16 | fluxTickets16<<16), scale 1.0 = 1024.0.
+// Reserves ticket = ceil(max(rU, gU, bU) / 16) (1..32) gated at <= 3840u (3840 * 16 = 61,440 < 65,535),
+// allowing up to 3,840 stars/pixel (40x higher than 96-hit cap) with zero R16->G16/B16 carry and 0.0000% shimmer
+// even on 80+ SM discrete GPUs where hundreds of warps hit Galactic-core pixels concurrently.
 fn splat_optical_pixel(px: i32, py: i32, baseColor: vec3<f32>, safeAlpha: f32, exposure: f32) {
     if (px < 0 || py < 0 || px >= i32(u.screenWidth) || py >= i32(u.screenHeight)) {
         return;
@@ -566,20 +588,28 @@ fn splat_optical_pixel(px: i32, py: i32, baseColor: vec3<f32>, safeAlpha: f32, e
         return;
     }
     let base2 = idx * 2u;
-    let w0 = atomicLoad(&accumBuf[base2]);
-    let w1 = atomicLoad(&accumBuf[base2 + 1u]);
-    let curR = w0 & 0xFFFFu;
-    let curG = w0 >> 16u;
-    let curB = w1 & 0xFFFFu;
-    if (curR >= 1024u && curG >= 1024u && curB >= 1024u) {
+    let preW1 = atomicLoad(&accumBuf[base2 + 1u]);
+    if ((preW1 >> 16u) >= 3840u) {
         return;
     }
 
     let srgb = linear_to_srgb(three_aces_filmic(baseColor * safeAlpha, exposure));
     let scale = 1024.0;
-    let rU = select(min(u32(max(0.0, srgb.r * scale + 0.5)), 512u), 0u, curR >= 1024u);
-    let gU = select(min(u32(max(0.0, srgb.g * scale + 0.5)), 512u), 0u, curG >= 1024u);
-    let bU = select(min(u32(max(0.0, srgb.b * scale + 0.5)), 512u), 0u, curB >= 1024u);
+    let rU = min(u32(max(0.0, srgb.r * scale + 0.5)), 512u);
+    let gU = min(u32(max(0.0, srgb.g * scale + 0.5)), 512u);
+    let bU = min(u32(max(0.0, srgb.b * scale + 0.5)), 512u);
+    let cMax = max(rU, max(gU, bU));
+    if (cMax == 0u) {
+        return;
+    }
+
+    let ticket = (cMax + 15u) >> 4u;
+    let prevW1 = atomicAdd(&accumBuf[base2 + 1u], ticket << 16u);
+    let prevTickets = prevW1 >> 16u;
+    if (prevTickets + ticket > 3840u) {
+        atomicSub(&accumBuf[base2 + 1u], ticket << 16u);
+        return;
+    }
 
     let rgPack = rU | (gU << 16u);
     if (rgPack > 0u) {
@@ -590,12 +620,13 @@ fn splat_optical_pixel(px: i32, py: i32, baseColor: vec3<f32>, safeAlpha: f32, e
     }
 }
 
-// Mode 1 (BOTH Categorical & Generic Numeric Log-Density — D10):
-// - accumBuf[base2 + 0u]: exact 32-bit weighted hit count (prevW = atomicAdd(...))
-// - accumBuf[base2 + 1u]:
-//   - Categorical (isCat=true):  R10 | (G10 << 10) | (B10 << 20), first 64 weight units x 15 (64 * 15 = 960 < 1024)
-//   - Numeric     (isCat=false): order-independent scalar sum sum(tU * wVal), tU in 0..1023, gated at prevW < 1048576u
-//     (1,048,576 * 1,023 = 1,072,693,248 < 2^32 -> 0.0000% shimmer, 1,024 levels, zero overflow!)
+// Mode 1 (BOTH Categorical & Generic Numeric Log-Density — D10 + v0.1.1 Pushback #11):
+// - Categorical (isCat=true):
+//   - word0 = rSum_u16 | (wRgbSum_u16 << 16), word1 = gSum_u16 | (bSum_u16 << 16)
+//   - Q = 12.0 (64/64 unique palette colors), wRgb = max(1u, (w + 1u) >> 1u), interval-gated at
+//     wRgbSum < 5120u (5120 * 12 = 61,440 < 65,535 -> 2,560 center hits, zero carry, 0.0000% shimmer)
+// - Numeric (isCat=false):
+//   - word0 = exact 32-bit weighted hit count, word1 = sum(tU * wVal) gated at prevW < 1048576u
 fn splat_log_density_pixel(px: i32, py: i32, baseColor: vec3<f32>, tNorm: f32, w: u32, isCat: bool) {
     if (px < 0 || py < 0 || px >= i32(u.screenWidth) || py >= i32(u.screenHeight) || w == 0u) {
         return;
@@ -605,16 +636,34 @@ fn splat_log_density_pixel(px: i32, py: i32, baseColor: vec3<f32>, tNorm: f32, w
         return;
     }
     let base2 = idx * 2u;
-    let prevW = atomicAdd(&accumBuf[base2], w);
     if (isCat) {
-        if (prevW < 64u) {
-            let wRgb = min(w, 64u - prevW);
-            let rQ = u32(clamp(round(baseColor.r * 15.0), 0.0, 15.0)) * wRgb;
-            let gQ = u32(clamp(round(baseColor.g * 15.0), 0.0, 15.0)) * wRgb;
-            let bQ = u32(clamp(round(baseColor.b * 15.0), 0.0, 15.0)) * wRgb;
-            atomicAdd(&accumBuf[base2 + 1u], rQ | (gQ << 10u) | (bQ << 20u));
+        let wRgb = max(1u, (w + 1u) >> 1u);
+        let preW0 = atomicLoad(&accumBuf[base2]);
+        if ((preW0 >> 16u) >= 5120u) {
+            return;
+        }
+        let prevW0 = atomicAdd(&accumBuf[base2], wRgb << 16u);
+        let prevWRgb = prevW0 >> 16u;
+        if (prevWRgb >= 5120u) {
+            atomicSub(&accumBuf[base2], wRgb << 16u);
+            return;
+        }
+        let effWRgb = min(wRgb, 5120u - prevWRgb);
+        if (effWRgb < wRgb) {
+            atomicSub(&accumBuf[base2], (wRgb - effWRgb) << 16u);
+        }
+        let rQ = u32(clamp(round(baseColor.r * 12.0), 0.0, 12.0)) * effWRgb;
+        let gQ = u32(clamp(round(baseColor.g * 12.0), 0.0, 12.0)) * effWRgb;
+        let bQ = u32(clamp(round(baseColor.b * 12.0), 0.0, 12.0)) * effWRgb;
+        if (rQ > 0u) {
+            atomicAdd(&accumBuf[base2], rQ);
+        }
+        let gbPack = gQ | (bQ << 16u);
+        if (gbPack > 0u) {
+            atomicAdd(&accumBuf[base2 + 1u], gbPack);
         }
     } else {
+        let prevW = atomicAdd(&accumBuf[base2], w);
         if (prevW < 1048576u) {
             let wVal = min(w, 1048576u - prevW);
             let tU = min(u32(clamp(tNorm, 0.0, 1.0) * 1023.0 + 0.5), 1023u);
@@ -708,6 +757,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let xIsY16 = (u.flags & 4096u) != 0u;
     let yIsX16 = (u.flags & 8192u) != 0u;
     let isTransitioning = (u.extraFlags & 65536u) != 0u;
+    let isXLiteral = (u.extraFlags & (1u << 21u)) != 0u;
+    let isYLiteral = (u.extraFlags & (1u << 22u)) != 0u;
+    let prevIsXLiteral = (u.extraFlags & (1u << 23u)) != 0u;
+    let prevIsYLiteral = (u.extraFlags & (1u << 24u)) != 0u;
+    let hasColorBuf = (u.extraFlags & (1u << 25u)) != 0u;
+    let hasSizeBuf = (u.extraFlags & (1u << 26u)) != 0u;
+    let hasXBuf = (u.extraFlags & (1u << 27u)) != 0u;
+    let hasYBuf = (u.extraFlags & (1u << 28u)) != 0u;
+    let hasAuxBuf = (u.extraFlags & (1u << 29u)) != 0u;
+    let hasPrevYBuf = (u.extraFlags & (1u << 30u)) != 0u;
 
     let xyPacked = xyBuf[i];
     let rawX = f32(xyPacked & 0xFFFFu) / 65535.0;
@@ -730,7 +789,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // 2. Magnitude / visibility check (finite check only — preserves M_G <= 0 bright stars!)
     let sizeSrc = (u.flags >> 16u) & 3u;
-    var rawSize = sizeBuf[i];
+    var rawSize = 0.0;
+    if (hasSizeBuf) {
+        rawSize = sizeBuf[i];
+    }
     if (u.mode == 0u || u.mode == 3u) {
         if (!(rawSize == rawSize)) {
             return;
@@ -754,22 +816,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (isXSpatial) {
         relWorldX = u.rtcBaseX + select(subX, subY, xIsY16) * u.rtcStepX;
     } else {
+        if (!hasXBuf) {
+            return;
+        }
         let xv = xBuf[i];
         if (!(xv == xv)) {
             return;
         }
-        relWorldX = map_linear(xv, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax) - u.camLeft;
+        relWorldX = project_non_spatial_rtc(
+            xv,
+            u.xDomMin,
+            u.xDomMax,
+            u.rtcBaseX,
+            u.rtcStepX,
+            isXLiteral
+        );
     }
 
     var fromTopY = 0.0;
     if (isYSpatial) {
         fromTopY = u.rtcBaseY + select(subY, subX, yIsX16) * u.rtcStepY;
     } else {
+        if (!hasYBuf) {
+            return;
+        }
         let yv = yBuf[i];
         if (!(yv == yv)) {
             return;
         }
-        fromTopY = u.camTop - map_linear(yv, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
+        fromTopY = project_non_spatial_rtc(
+            yv,
+            u.yDomMin,
+            u.yDomMax,
+            u.rtcBaseY,
+            u.rtcStepY,
+            isYLiteral
+        );
     }
 
     // Smooth 2-second WGSL axis transition (D9)
@@ -783,22 +865,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (prevIsXSpatial) {
             prevRelX = u.prevRtcBaseX + select(subX, subY, prevXIsY16) * u.prevRtcStepX;
         } else {
+            if (!hasAuxBuf) {
+                return;
+            }
             let pxv = auxBuf[i];
             if (!(pxv == pxv)) {
                 return;
             }
-            prevRelX = map_linear(pxv, u.prevXDomMin, u.prevXDomMax, u.prevXRangeMin, u.prevXRangeMax) - u.camLeft;
+            prevRelX = project_non_spatial_rtc(
+                pxv,
+                u.prevXDomMin,
+                u.prevXDomMax,
+                u.prevRtcBaseX,
+                u.prevRtcStepX,
+                prevIsXLiteral
+            );
         }
 
         var prevFromTopY = 0.0;
         if (prevIsYSpatial) {
             prevFromTopY = u.prevRtcBaseY + select(subY, subX, prevYIsX16) * u.prevRtcStepY;
         } else {
+            if (!hasPrevYBuf) {
+                return;
+            }
             let pyv = prevYBuf[i];
             if (!(pyv == pyv)) {
                 return;
             }
-            prevFromTopY = u.camTop - map_linear(pyv, u.prevYDomMin, u.prevYDomMax, u.prevYRangeMin, u.prevYRangeMax);
+            prevFromTopY = project_non_spatial_rtc(
+                pyv,
+                u.prevYDomMin,
+                u.prevYDomMax,
+                u.prevRtcBaseY,
+                u.prevRtcStepY,
+                prevIsYLiteral
+            );
         }
 
         relWorldX = mix(prevRelX, relWorldX, u.transitionT);
@@ -826,12 +928,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         var weightScale = 1u;
 
         if (metricType == 0u) {
+            if (!hasColorBuf) {
+                return;
+            }
             let rawC = colorBuf[i];
-            if (!(rawC == rawC) || (rawC <= 0.0 && u.colorMin > 100.0)) {
+            if (!(rawC == rawC)) {
+                return;
+            }
+            val = rawC;
+        } else if (metricType == 6u) {
+            if (!hasColorBuf) {
+                return;
+            }
+            let rawC = colorBuf[i];
+            if (!(rawC == rawC) || rawC <= 0.0) {
                 return;
             }
             val = rawC;
         } else if (metricType == 1u) {
+            if (!hasColorBuf || !hasXBuf) {
+                return;
+            }
             let bpRp = colorBuf[i];
             let teff = xBuf[i];
             if (!(bpRp == bpRp) || !(teff == teff) || teff < 2600.0) {
@@ -841,6 +958,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let eBpRp = max(0.0, bpRp - intrinsicBpRp);
             val = 2.05 * eBpRp;
         } else if (metricType == 2u) {
+            if (!hasColorBuf || !hasXBuf) {
+                return;
+            }
             let bpRp = colorBuf[i];
             let teff = xBuf[i];
             if (!(bpRp == bpRp) || !(teff == teff) || teff < 2800.0) {
@@ -854,13 +974,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let absL = abs(lb.x);
             let expectedBpRp = clamp(8200.0 / clamp(teff, 3000.0, 15000.0) - 0.58, -0.40, 2.50);
             let photoMetal = clamp((bpRp - expectedBpRp) * 0.45, -0.45, 0.45);
-            let vr = auxBuf[i];
-            let absVr = select(25.0, abs(vr), (vr == vr));
+            var absVr = 25.0;
+            if (hasAuxBuf) {
+                let vr = auxBuf[i];
+                if (vr == vr) {
+                    absVr = abs(vr);
+                }
+            }
             let kinMetal = clamp((26.0 - absVr) * 0.012, -0.55, 0.25);
             let diskBoost = exp(-absB * 9.5) * (0.30 + 0.18 * exp(-absL * 1.2));
             let bulgeHaloLobe = exp(-(absL * absL) / 0.12) * exp(-((absB - 0.34) * (absB - 0.34)) / 0.055) * (1.0 - exp(-absB * 14.0));
             val = photoMetal * 0.45 + kinMetal * 0.55 + diskBoost - bulgeHaloLobe * 0.75 - 0.18 * smoothstep(0.15, 0.9, absB);
         } else if (metricType == 3u) {
+            if (!hasColorBuf || !hasXBuf) {
+                return;
+            }
             let bpRp = colorBuf[i];
             let teff = xBuf[i];
             if (!(bpRp == bpRp) || !(teff == teff) || teff < 2800.0) {
@@ -884,7 +1012,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (absB < dustGapHalfWidth) {
                 return;
             }
-            let plx = auxBuf[i];
+            var plx = 0.0;
+            var plxValid = false;
+            if (hasAuxBuf) {
+                plx = auxBuf[i];
+                plxValid = (plx == plx);
+            }
             let dLmc = length(vec2<f32>(globalX - 0.709, (globalY - 0.712) * 1.4));
             let dSmc = length(vec2<f32>(globalX - 0.634, (globalY - 0.774) * 1.4));
             let dSgr = length(vec2<f32>((globalX - 0.483) * 1.6, (globalY - 0.587) * 0.7));
@@ -893,7 +1026,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
             let rrHash = pcg_hash(i * 1664525u + 1013904223u);
             let keepProb = select(select(0.0055, 0.022, isBulge), 0.18, isDwarfGal);
-            if ((plx == plx && plx > 0.85 && !isBulge) || rrHash > keepProb) {
+            if ((plxValid && plx > 0.85 && !isBulge) || rrHash > keepProb) {
                 return;
             }
 
@@ -918,13 +1051,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             return;
         } else if (metricType == 5u) {
+            if (!hasColorBuf) {
+                return;
+            }
             let vr = colorBuf[i];
             if (!(vr == vr)) {
                 return;
             }
             val = vr;
-            let plx = auxBuf[i];
-            if (!(plx == plx) || plx < 0.8) {
+            var farPlx = true;
+            if (hasAuxBuf) {
+                let plx = auxBuf[i];
+                if ((plx == plx) && plx >= 0.8) {
+                    farPlx = false;
+                }
+            }
+            if (farPlx) {
                 weightScale = 5u;
             }
         }
@@ -961,24 +1103,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // MODE 4: 3D Stellar Motion Map (Vr + LIC Streamlines, with cpy < screenHeight guard)
     // =========================================================================
     if (u.mode == 4u) {
-        let vr = colorBuf[i];
-        let plx = auxBuf[i];
-        if (vr == vr) {
-            let wScale = select(1u, 4u, !(plx == plx) || plx < 0.8);
-            let cSpan = max(u.colorMax - u.colorMin, 1e-6);
-            let mid = 0.5 * (u.colorMin + u.colorMax);
-            let encSpan = 3.0 * cSpan;
-            let encMin = mid - 0.5 * encSpan;
-            let tVrEnc = clamp((vr - encMin) / encSpan, 0.0, 1.0);
+        if (hasColorBuf) {
+            let vr = colorBuf[i];
+            if (vr == vr) {
+                var farPlx4 = true;
+                if (hasAuxBuf) {
+                    let plx = auxBuf[i];
+                    if ((plx == plx) && plx >= 0.8) {
+                        farPlx4 = false;
+                    }
+                }
+                let wScale = select(1u, 4u, farPlx4);
+                let cSpan = max(u.colorMax - u.colorMin, 1e-6);
+                let mid = 0.5 * (u.colorMin + u.colorMax);
+                let encSpan = 3.0 * cSpan;
+                let encMin = mid - 0.5 * encSpan;
+                let tVrEnc = clamp((vr - encMin) / encSpan, 0.0, 1.0);
 
-            splat_motion3d_field(cpx, cpy, tVrEnc, 3u * wScale);
-            splat_motion3d_field(cpx - 1, cpy, tVrEnc, 1u * wScale);
-            splat_motion3d_field(cpx + 1, cpy, tVrEnc, 1u * wScale);
-            splat_motion3d_field(cpx, cpy - 1, tVrEnc, 1u * wScale);
-            splat_motion3d_field(cpx, cpy + 1, tVrEnc, 1u * wScale);
+                splat_motion3d_field(cpx, cpy, tVrEnc, 3u * wScale);
+                splat_motion3d_field(cpx - 1, cpy, tVrEnc, 1u * wScale);
+                splat_motion3d_field(cpx + 1, cpy, tVrEnc, 1u * wScale);
+                splat_motion3d_field(cpx, cpy - 1, tVrEnc, 1u * wScale);
+                splat_motion3d_field(cpx, cpy + 1, tVrEnc, 1u * wScale);
+            }
         }
 
-        if (u32(cpx) < u.screenWidth && u32(cpy) < u.screenHeight) {
+        if (u32(cpx) < u.screenWidth && u32(cpy) < u.screenHeight && hasXBuf && hasYBuf) {
             let cellX = u32(cpx) / 5u;
             let cellY = u32(cpy) / 5u;
             let cellHash = pcg_hash((cellX * 73856093u) ^ (cellY * 19349663u));
@@ -1034,10 +1184,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // =========================================================================
     // MODES 0, 1, 3: Optical Flux (0), Log-Density Points (1), & Star Trails (3)
     // =========================================================================
-    let colorVal = colorBuf[i];
+    var colorVal = 0.0;
+    if (hasColorBuf) {
+        colorVal = colorBuf[i];
+    }
     let colorSrc = (u.flags >> 14u) & 3u;
     let isCatMode = (u.mode == 1u) && ((u.flags & 4u) != 0u);
-    if (u.mode == 1u && !isCatMode && colorSrc == 0u && !(colorVal == colorVal)) {
+    if (u.mode == 1u && !isCatMode && colorSrc == 0u && hasColorBuf && !(colorVal == colorVal)) {
         return;
     }
 
@@ -1115,67 +1268,69 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        let plx = auxBuf[i];
         let maxTrailMag = 9.6;
-        if ((plx == plx) && (plx >= u.minParallax) && (rawSize <= maxTrailMag)) {
-            let pmra = xBuf[i];
-            let pmdec = yBuf[i];
-            if ((pmra == pmra) && (pmdec == pmdec)) {
-                var lb = vec2<f32>(0.0);
-                if (inverse_hammer(globalX, globalY, &lb)) {
-                    var uGal = vec3<f32>(0.0);
-                    let duGal = icrs_pm_to_gal_vel(lb.x, lb.y, pmra, pmdec, &uGal);
-                    let isCometMode = ((u.extraFlags & 8u) != 0u) || ((u.extraFlags & 4u) != 0u);
-                    let tEndKyr = max(1.0, u.trailTimeKyr);
-                    let tStartKyr = select(0.0, max(0.0, tEndKyr - 80.0), isCometMode);
+        if (hasAuxBuf && hasXBuf && hasYBuf && (rawSize <= maxTrailMag)) {
+            let plx = auxBuf[i];
+            if ((plx == plx) && (plx >= u.minParallax)) {
+                let pmra = xBuf[i];
+                let pmdec = yBuf[i];
+                if ((pmra == pmra) && (pmdec == pmdec)) {
+                    var lb = vec2<f32>(0.0);
+                    if (inverse_hammer(globalX, globalY, &lb)) {
+                        var uGal = vec3<f32>(0.0);
+                        let duGal = icrs_pm_to_gal_vel(lb.x, lb.y, pmra, pmdec, &uGal);
+                        let isCometMode = ((u.extraFlags & 8u) != 0u) || ((u.extraFlags & 4u) != 0u);
+                        let tEndKyr = max(1.0, u.trailTimeKyr);
+                        let tStartKyr = select(0.0, max(0.0, tEndKyr - 80.0), isCometMode);
 
-                    let rStart = normalize(uGal + duGal * tStartKyr);
-                    let rEnd = normalize(uGal + duGal * tEndKyr);
-                    let gStart = forward_hammer_vec(rStart);
-                    let gEnd = forward_hammer_vec(rEnd);
+                        let rStart = normalize(uGal + duGal * tStartKyr);
+                        let rEnd = normalize(uGal + duGal * tEndKyr);
+                        let gStart = forward_hammer_vec(rStart);
+                        let gEnd = forward_hammer_vec(rEnd);
 
-                    let wx0 = map_linear(gStart.x, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax);
-                    let wy0 = map_linear(gStart.y, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
-                    let wx1 = map_linear(gEnd.x, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax);
-                    let wy1 = map_linear(gEnd.y, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
+                        let wx0 = map_linear(gStart.x, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax);
+                        let wy0 = map_linear(gStart.y, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
+                        let wx1 = map_linear(gEnd.x, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax);
+                        let wy1 = map_linear(gEnd.y, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
 
-                    let px0 = ((wx0 - u.camLeft) * u.invCamSpanX) * f32(u.screenWidth);
-                    let py0 = ((u.camTop - wy0) * u.invCamSpanY) * f32(u.screenHeight);
-                    let px1 = ((wx1 - u.camLeft) * u.invCamSpanX) * f32(u.screenWidth);
-                    let py1 = ((u.camTop - wy1) * u.invCamSpanY) * f32(u.screenHeight);
+                        let px0 = ((wx0 - u.camLeft) * u.invCamSpanX) * f32(u.screenWidth);
+                        let py0 = ((u.camTop - wy0) * u.invCamSpanY) * f32(u.screenHeight);
+                        let px1 = ((wx1 - u.camLeft) * u.invCamSpanX) * f32(u.screenWidth);
+                        let py1 = ((u.camTop - wy1) * u.invCamSpanY) * f32(u.screenHeight);
 
-                    let chordPx = sqrt((px1 - px0) * (px1 - px0) + (py1 - py0) * (py1 - py0));
-                    let numSteps = clamp(i32(ceil(chordPx * 1.15)), 4, 96);
-                    let invSteps = 1.0 / f32(numSteps);
+                        let chordPx = sqrt((px1 - px0) * (px1 - px0) + (py1 - py0) * (py1 - py0));
+                        let numSteps = clamp(i32(ceil(chordPx * 1.15)), 4, 96);
+                        let invSteps = 1.0 / f32(numSteps);
 
-                    let starBright = clamp((9.8 - rawSize) / 7.5, 0.25, 1.0);
-                    let trailColor = mix(vec3<f32>(0.93, 0.96, 1.0), baseColor, 0.10);
+                        let starBright = clamp((9.8 - rawSize) / 7.5, 0.25, 1.0);
+                        let trailColor = mix(vec3<f32>(0.93, 0.96, 1.0), baseColor, 0.10);
 
-                    var prevTx = -99999;
-                    var prevTy = -99999;
-                    for (var s = 0; s <= numSteps; s = s + 1) {
-                        let frac = f32(s) * invSteps;
-                        let tKyr = mix(tStartKyr, tEndKyr, frac);
-                        let rGal = normalize(uGal + duGal * tKyr);
-                        let gxy = forward_hammer_vec(rGal);
+                        var prevTx = -99999;
+                        var prevTy = -99999;
+                        for (var s = 0; s <= numSteps; s = s + 1) {
+                            let frac = f32(s) * invSteps;
+                            let tKyr = mix(tStartKyr, tEndKyr, frac);
+                            let rGal = normalize(uGal + duGal * tKyr);
+                            let gxy = forward_hammer_vec(rGal);
 
-                        let wx = map_linear(gxy.x, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax);
-                        let wy = map_linear(gxy.y, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
-                        let nx = (wx - u.camLeft) * u.invCamSpanX;
-                        let ny = (u.camTop - wy) * u.invCamSpanY;
+                            let wx = map_linear(gxy.x, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax);
+                            let wy = map_linear(gxy.y, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
+                            let nx = (wx - u.camLeft) * u.invCamSpanX;
+                            let ny = (u.camTop - wy) * u.invCamSpanY;
 
-                        if (nx >= 0.0 && nx < 1.0 && ny >= 0.0 && ny < 1.0) {
-                            let tx = i32(round(nx * f32(u.screenWidth)));
-                            let ty = i32(round(ny * f32(u.screenHeight)));
-                            if (tx != prevTx || ty != prevTy) {
-                                let profile = select(mix(0.60, 1.0, frac), mix(0.20, 1.0, frac * frac), isCometMode);
-                                let trailAlpha = (0.045 + 0.16 * starBright) * profile * fadeAlpha;
-                                splat_optical_pixel(tx, ty, trailColor, trailAlpha, 1.35);
-                                if (starBright > 0.68 && (s == numSteps || !isCometMode)) {
-                                    splat_optical_pixel(tx, ty + 1, trailColor, trailAlpha * 0.28, 1.20);
+                            if (nx >= 0.0 && nx < 1.0 && ny >= 0.0 && ny < 1.0) {
+                                let tx = i32(round(nx * f32(u.screenWidth)));
+                                let ty = i32(round(ny * f32(u.screenHeight)));
+                                if (tx != prevTx || ty != prevTy) {
+                                    let profile = select(mix(0.60, 1.0, frac), mix(0.20, 1.0, frac * frac), isCometMode);
+                                    let trailAlpha = (0.045 + 0.16 * starBright) * profile * fadeAlpha;
+                                    splat_optical_pixel(tx, ty, trailColor, trailAlpha, 1.35);
+                                    if (starBright > 0.68 && (s == numSteps || !isCometMode)) {
+                                        splat_optical_pixel(tx, ty + 1, trailColor, trailAlpha * 0.28, 1.20);
+                                    }
+                                    prevTx = tx;
+                                    prevTy = ty;
                                 }
-                                prevTx = tx;
-                                prevTy = ty;
                             }
                         }
                     }
@@ -1301,32 +1456,36 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     let w1 = accumBuf[base2 + 1u];
     let metricType = (u.extraFlags >> 8u) & 15u;
 
-    // Mode 1 Resolve (Categorical & Generic Numeric Log-Density — D10 + Phase 8b Multiscale refCount):
+    // Mode 1 Resolve (Categorical & Generic Numeric Log-Density — D10 + v0.1.1 Pushback #11):
     if (u.mode == 1u) {
-        if (w0 == 0u) {
-            return vec4<f32>(bg, 1.0);
-        }
         let isCat = (u.flags & 4u) != 0u;
         var meanRgb = vec3<f32>(0.0);
+        var count = 0.0;
         if (isCat) {
-            let rgbW = min(w0, 64u);
-            let rgbDenom = max(1.0, f32(rgbW) * 15.0);
+            let wRgbSum = w0 >> 16u;
+            if (wRgbSum == 0u) {
+                return vec4<f32>(bg, 1.0);
+            }
+            let rSum = f32(w0 & 0xFFFFu);
+            let gSum = f32(w1 & 0xFFFFu);
+            let bSum = f32(w1 >> 16u);
+            let rgbDenom = max(1.0, f32(wRgbSum) * 12.0);
             meanRgb = clamp(
-                vec3<f32>(
-                    f32(w1 & 0x3FFu),
-                    f32((w1 >> 10u) & 0x3FFu),
-                    f32((w1 >> 20u) & 0x3FFu)
-                ) / rgbDenom,
+                vec3<f32>(rSum, gSum, bSum) / rgbDenom,
                 vec3<f32>(0.0),
                 vec3<f32>(1.0)
             );
+            count = f32(wRgbSum) * 0.5;
         } else {
+            if (w0 == 0u) {
+                return vec4<f32>(bg, 1.0);
+            }
             let valW = min(w0, 1048576u);
             let meanT = clamp(f32(w1) / max(1.0, f32(valW) * 1023.0), 0.0, 1.0);
             let scaleId = (u.flags >> 8u) & 15u;
             meanRgb = eval_ramp(meanT, scaleId);
+            count = f32(w0) * 0.25;
         }
-        let count = f32(w0) * 0.25;
         let refCount = max(1.05, u.mode1RefCount);
         let logT = clamp(log2(1.0 + count) / log2(1.0 + refCount), 0.0, 1.0);
         let opScale = select(1.0, clamp(u.resolvedPointOpacity * 2.5, 0.05, 2.5), u.resolvedPointOpacity >= 0.0);
@@ -1612,10 +1771,27 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         isYAxis: boolean,
         camLeftOrTop: number
     ): { base: number; step: number } {
-        const isY16 = axis.field === 'y_u16';
-        const tileOff = isY16 ? tileOffsetY : tileOffsetX;
+        const isSpatial = axis.field === 'x_u16' || axis.field === 'y_u16';
         const domSpan = axis.domain[1] - axis.domain[0];
         const safeDomSpan = Math.abs(domSpan) < 1e-12 ? 1.0 : domSpan;
+        if (!isSpatial) {
+            const worldSpan = axis.range[1] - axis.range[0];
+            if (Math.abs(worldSpan) < 1e-12) {
+                return {
+                    base: isYAxis ? camLeftOrTop - axis.range[0] : axis.range[0] - camLeftOrTop,
+                    step: 0.0,
+                };
+            }
+            const worldScale = worldSpan / safeDomSpan;
+            const camAnchorData = axis.domain[0] + (camLeftOrTop - axis.range[0]) / worldScale;
+            return {
+                base: camAnchorData,
+                step: isYAxis ? -worldScale : worldScale,
+            };
+        }
+
+        const isY16 = axis.field === 'y_u16';
+        const tileOff = isY16 ? tileOffsetY : tileOffsetX;
         const worldScale = (axis.range[1] - axis.range[0]) / safeDomSpan;
         const worldTile0 = axis.range[0] + (tileOff - axis.domain[0]) * worldScale;
 
@@ -1678,22 +1854,18 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         const colorField = isOptical ? optColorField : cfg.color.field;
         const sizeField = isOptical ? magField : cfg.size.field;
 
-        const isXSpatial =
-            xAxis.field === 'x_u16' || xAxis.field === 'y_u16' || xAxis.transform === 'literal';
-        const isYSpatial =
-            yAxis.field === 'y_u16' || yAxis.field === 'x_u16' || yAxis.transform === 'literal';
+        const isXSpatial = xAxis.field === 'x_u16' || xAxis.field === 'y_u16';
+        const isYSpatial = yAxis.field === 'y_u16' || yAxis.field === 'x_u16';
+        const isXLiteral = !isXSpatial && xAxis.transform === 'literal';
+        const isYLiteral = !isYSpatial && yAxis.transform === 'literal';
         const xIsY16 = xAxis.field === 'y_u16';
         const yIsX16 = yAxis.field === 'x_u16';
 
         const isTransitioning = tileStore.isTransitioning && !isOptical && computeMode !== 3 && computeMode !== 4;
-        const prevIsXSpatial =
-            prevCfg.x.field === 'x_u16' ||
-            prevCfg.x.field === 'y_u16' ||
-            prevCfg.x.transform === 'literal';
-        const prevIsYSpatial =
-            prevCfg.y.field === 'y_u16' ||
-            prevCfg.y.field === 'x_u16' ||
-            prevCfg.y.transform === 'literal';
+        const prevIsXSpatial = prevCfg.x.field === 'x_u16' || prevCfg.x.field === 'y_u16';
+        const prevIsYSpatial = prevCfg.y.field === 'y_u16' || prevCfg.y.field === 'x_u16';
+        const prevIsXLiteral = !prevIsXSpatial && prevCfg.x.transform === 'literal';
+        const prevIsYLiteral = !prevIsYSpatial && prevCfg.y.transform === 'literal';
         const prevXIsY16 = prevCfg.x.field === 'y_u16';
         const prevYIsX16 = prevCfg.y.field === 'x_u16';
 
@@ -1716,16 +1888,21 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             (sizeSrc << 16);
 
         const extraFlags =
-            (tileStore.lightBackground ? 1 : 0) |
-            (tileStore.invertColorScale ? 2 : 0) |
-            (tileStore.animateFlow ? 4 : 0) |
-            ((tileStore.trailMode & 1) << 3) |
-            ((tileStore.metricType & 15) << 8) |
-            (isTransitioning ? 65536 : 0) |
-            (prevIsXSpatial ? 131072 : 0) |
-            (prevIsYSpatial ? 262144 : 0) |
-            (prevXIsY16 ? 524288 : 0) |
-            (prevYIsX16 ? 1048576 : 0);
+            ((tileStore.lightBackground ? 1 : 0) |
+                (tileStore.invertColorScale ? 2 : 0) |
+                (tileStore.animateFlow ? 4 : 0) |
+                ((tileStore.trailMode & 1) << 3) |
+                ((tileStore.metricType & 15) << 8) |
+                (isTransitioning ? 65536 : 0) |
+                (prevIsXSpatial ? 131072 : 0) |
+                (prevIsYSpatial ? 262144 : 0) |
+                (prevXIsY16 ? 524288 : 0) |
+                (prevYIsX16 ? 1048576 : 0) |
+                (isXLiteral ? 1 << 21 : 0) |
+                (isYLiteral ? 1 << 22 : 0) |
+                (prevIsXLiteral ? 1 << 23 : 0) |
+                (prevIsYLiteral ? 1 << 24 : 0)) >>>
+            0;
 
         const globalTime = tileStore.globalTimeSec;
         const zoomT = Math.max(0.0, Math.min(1.0, this.rendererWrapper.zoomT));
@@ -1865,6 +2042,14 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
             const base = slotIdx * (SLOT_UNIFORM_STRIDE / 4);
             writeCommonUniforms(base);
+            const slotBufFlags =
+                (colorBuf !== dummy ? 1 << 25 : 0) |
+                (sizeBuf !== dummy ? 1 << 26 : 0) |
+                (xBuf !== dummy ? 1 << 27 : 0) |
+                (yBuf !== dummy ? 1 << 28 : 0) |
+                (auxOrPrevXBuf !== dummy ? 1 << 29 : 0) |
+                (prevYBuf !== dummy ? 1 << 30 : 0);
+            this.uniformU32[base + 35] = (extraFlags | slotBufFlags) >>> 0;
             this.uniformU32[base + 6] = slotObj.activeRows;
 
             this.uniformF32[base + 8] = slotObj.tileOffsetX;

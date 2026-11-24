@@ -8,8 +8,8 @@ import {
     type RangeResponse,
 } from 'pmtiles';
 import PQueue from 'p-queue';
-import { tableFromIPC } from 'apache-arrow';
 import { decompressSync } from 'fflate';
+import type { BoundingBox, CustomRangeSource, TileSource } from './lib/types.ts';
 
 const MAX_COL_POOL_PER_COLUMN = 16;
 const MAX_RAW_PAYLOAD_POOL = 16;
@@ -17,33 +17,58 @@ const MAX_RAW_PICK_CACHE_ENTRIES = 8;
 const MAX_RAW_PICK_CACHE_BYTES = 24 * 1024 * 1024; // 24 MiB hard cap for compressed pick tile LRU
 const MAX_TILE_FAILURE_ATTEMPTS = 4;
 const BASE_RETRY_DELAY_MS = 500;
+const MIN_TILE_CACHE_SIZE = 32; // >= 21 pinned Z=0..2 overview tiles + working budget
+
+function isCustomRangeSource(src: TileSource): src is CustomRangeSource {
+    return (
+        typeof src === 'object' &&
+        src !== null &&
+        !(typeof File !== 'undefined' && src instanceof File) &&
+        typeof (src as CustomRangeSource).getBytes === 'function'
+    );
+}
 
 /**
- * Wraps `FetchSource` to pre-cache the entire PMTiles leaf directory region in RAM
- * (only 367 KB for all 193,246 tiles in `gaia_full.arrowtiles`).
- * Eliminates all secondary HTTP Range round-trips when zooming/panning into Z=5..8 subtrees.
+ * Wraps an HTTP `FetchSource` or `CustomRangeSource` to pre-cache the PMTiles leaf directory
+ * region in RAM (only 367 KB for 193,246 tiles in `gaia_full.arrowtiles`), eliminating
+ * secondary Range round-trips when zooming/panning into Z=5..8 subtrees, while cancelling
+ * any in-flight prefetch cleanly on `destroy()`.
  */
-class FastFetchSource implements Source {
-    private inner: FetchSource;
+export class FastFetchSource implements Source {
+    private inner: Source;
+    private maxLeafBytes: number;
+    private prefetchController = new AbortController();
     private leafOffset = -1;
     private leafLength = 0;
     private leafBuffer: ArrayBuffer | null = null;
     private leafPromise: Promise<ArrayBuffer | null> | null = null;
 
-    constructor(url: string) {
-        this.inner = new FetchSource(url);
-        (this.inner as any).chromeWindowsNoCache = false;
+    constructor(urlOrSource: string | Source, maxLeafBytes = 16 * 1024 * 1024) {
+        if (typeof urlOrSource === 'string') {
+            const fetchInner = new FetchSource(urlOrSource);
+            (fetchInner as any).chromeWindowsNoCache = false;
+            this.inner = fetchInner;
+        } else {
+            this.inner = urlOrSource;
+        }
+        this.maxLeafBytes = Math.max(0, maxLeafBytes);
     }
 
     public getKey(): string {
         return this.inner.getKey();
     }
 
-    public prefetchLeafDirectories(leafOffset: number, leafLength: number) {
+    public abortPrefetch(): void {
+        this.prefetchController.abort();
+    }
+
+    public prefetchLeafDirectories(leafOffset: number, leafLength: number): void {
         if (
+            this.prefetchController.signal.aborted ||
+            this.maxLeafBytes <= 0 ||
             !leafLength ||
             leafLength <= 0 ||
-            leafLength > 16 * 1024 * 1024 ||
+            leafLength > this.maxLeafBytes ||
             this.leafPromise
         ) {
             return;
@@ -51,10 +76,13 @@ class FastFetchSource implements Source {
         this.leafOffset = leafOffset;
         this.leafLength = leafLength;
         this.leafPromise = this.inner
-            .getBytes(leafOffset, leafLength)
+            .getBytes(leafOffset, leafLength, this.prefetchController.signal)
             .then((res) => {
-                this.leafBuffer = res.data;
-                return res.data;
+                if (!this.prefetchController.signal.aborted) {
+                    this.leafBuffer = res.data;
+                    return res.data;
+                }
+                return null;
             })
             .catch(() => null);
     }
@@ -76,11 +104,15 @@ class FastFetchSource implements Source {
                 return { data: buf.slice(relStart, relStart + length) };
             }
         }
-        return this.inner.getBytes(offset, length, signal, etag);
+        return this.inner.getBytes(
+            offset,
+            length,
+            signal ?? this.prefetchController.signal,
+            etag
+        );
     }
 }
 
-import type { BoundingBox } from './lib/types.ts';
 export type { BoundingBox };
 
 export interface TileData {
@@ -140,6 +172,10 @@ export class PMTilesClient {
         }
     >();
     private decompressResolvers = new Map<string, { resolve: Function; reject: Function }>();
+    private schemaResolvers = new Map<
+        string,
+        { resolve: (fields: SchemaField[]) => void; reject: (err: Error) => void }
+    >();
     private rowDecodeResolvers = new Map<
         string,
         { resolve: Function; reject: Function; onCacheMiss?: () => void }
@@ -167,6 +203,7 @@ export class PMTilesClient {
     } = { columns: new Map(), rawPayload: [] };
 
     private requestedColumns: string[] = ['xy_u16'];
+    private colOrigins: Record<string, number> = {};
 
     public fetchTelemetry = {
         net: [] as number[],
@@ -184,7 +221,7 @@ export class PMTilesClient {
     public archiveMaxZoom = 14;
 
     constructor(
-        coreSource: string | File,
+        coreSource: TileSource,
         layerUrls: string[],
         rootBounds: BoundingBox,
         maxCacheSize = 250,
@@ -192,7 +229,7 @@ export class PMTilesClient {
         archiveMaxZoom = 14
     ) {
         this.rootBounds = rootBounds;
-        this.maxCacheSize = maxCacheSize;
+        this.maxCacheSize = Math.max(MIN_TILE_CACHE_SIZE, maxCacheSize);
         this.schemaBuffer = schemaBuffer;
         this.archiveMaxZoom = Math.max(0, Math.min(20, archiveMaxZoom));
 
@@ -253,11 +290,22 @@ export class PMTilesClient {
         };
 
         const sharedCache = new SharedPromiseCache(1000, true, customDecompress);
-        const createPmtiles = (src: string | File, isCore = false) => {
+        const createPmtiles = (src: TileSource, isCore = false) => {
             let source: Source;
             let fastFetch: FastFetchSource | null = null;
             if (typeof src === 'string') {
-                fastFetch = new FastFetchSource(src);
+                fastFetch = new FastFetchSource(src, 16 * 1024 * 1024);
+                if (isCore) this.fastFetchSource = fastFetch;
+                source = fastFetch;
+            } else if (isCustomRangeSource(src)) {
+                const resolvedKey = src.key ?? src.getKey?.() ?? `custom_${this.clientSeq}`;
+                const adapted: Source = {
+                    getKey: () => resolvedKey,
+                    getBytes: (offset, length, signal, etag) =>
+                        src.getBytes(offset, length, signal, etag),
+                };
+                const maxPrefetch = src.maxLeafPrefetchBytes ?? 1 * 1024 * 1024;
+                fastFetch = new FastFetchSource(adapted, maxPrefetch);
                 if (isCore) this.fastFetchSource = fastFetch;
                 source = fastFetch;
             } else {
@@ -390,6 +438,10 @@ export class PMTilesClient {
         this.rootBounds = rootBounds;
     }
 
+    public setColOrigins(origins: Record<string, number>): void {
+        this.colOrigins = { ...origins };
+    }
+
     private recycleColumnMap(columns: Record<string, ArrayBuffer> | undefined): void {
         if (!columns) return;
         for (const colName of Object.keys(columns)) {
@@ -505,7 +557,7 @@ export class PMTilesClient {
                 if (req) req.tWorkerStart = performance.now();
             }
             worker.postMessage(payload, transfer);
-        } else if (payload.action === 'decompress') {
+        } else if (payload.action === 'decompress' || payload.action === 'get_schema') {
             this.pendingTasks.unshift({ payload, transfer, abortSignal });
         } else {
             this.pendingTasks.push({ payload, transfer, abortSignal });
@@ -533,7 +585,8 @@ export class PMTilesClient {
     public setRequestedColumns(cols: string[]) {
         const normalized = cols.includes('xy_u16') ? [...cols] : ['xy_u16', ...cols];
         const alreadyLoaded =
-            this.activeTiles.size > 0 && normalized.every((c) => this.requestedColumns.includes(c));
+            (this.activeTiles.size > 0 || this.loadingTiles.size > 0) &&
+            normalized.every((c) => this.requestedColumns.includes(c));
 
         if (alreadyLoaded) {
             return;
@@ -598,11 +651,19 @@ export class PMTilesClient {
             this.schemaBuffer = bytes;
         }
 
-        const table = tableFromIPC([bytes]);
-        return table.schema.fields.map((f) => ({
-            name: f.name,
-            type: String(f.type),
-        }));
+        const schemaCopy = bytes.slice();
+        return new Promise<SchemaField[]>((resolve, reject) => {
+            if (this.destroyed) {
+                reject(new Error('PMTilesClient destroyed'));
+                return;
+            }
+            const id = `schema_${++this.nextReqId}`;
+            this.schemaResolvers.set(id, { resolve, reject });
+            this.dispatchToWorker(
+                { action: 'get_schema', id, schemaBuffer: schemaCopy.buffer },
+                [schemaCopy.buffer]
+            );
+        });
     }
 
     private async fetchOrGetRawPickTile(
@@ -831,7 +892,9 @@ export class PMTilesClient {
     }
 
     public destroy() {
+        if (this.destroyed) return;
         this.destroyed = true;
+        this.fastFetchSource?.abortPrefetch();
         this.clearRawPickTileCache(false);
         for (const timer of this.retryTimers) {
             clearTimeout(timer);
@@ -846,6 +909,10 @@ export class PMTilesClient {
             dec.reject(new Error('PMTilesClient destroyed'));
         }
         this.decompressResolvers.clear();
+        for (const [, sch] of this.schemaResolvers) {
+            sch.reject(new Error('PMTilesClient destroyed'));
+        }
+        this.schemaResolvers.clear();
         for (const [, rowReq] of this.rowDecodeResolvers) {
             rowReq.reject(new Error('PMTilesClient destroyed'));
         }
@@ -873,6 +940,17 @@ export class PMTilesClient {
                 this.decompressResolvers.delete(data.id);
                 if (data.error) resolver.reject(new Error(data.error));
                 else resolver.resolve(data.buffer);
+            }
+            this.checkPendingTasks(worker);
+            return;
+        }
+
+        if (data.action === 'get_schema') {
+            const resolver = this.schemaResolvers.get(data.id);
+            if (resolver) {
+                this.schemaResolvers.delete(data.id);
+                if (data.error) resolver.reject(new Error(data.error));
+                else resolver.resolve(data.fields || []);
             }
             this.checkPendingTasks(worker);
             return;
@@ -1121,6 +1199,17 @@ export class PMTilesClient {
             }
         }
 
+        // Release any tile that finished worker decoding after the camera moved off-screen
+        // before it was ever uploaded to a GPU slot (`0 B` duplicate/orphaned CPU column retention).
+        for (const [key, tile] of Array.from(this.activeTiles.entries())) {
+            if (!this.currentlyVisibleIds.has(key) && !tile.uploadedToGpu) {
+                this.recycleColumnMap(tile.columns);
+                tile.columns = {};
+                this.activeTiles.delete(key);
+                this.lastSeenTimestamp.delete(key);
+            }
+        }
+
         // Evict LRU off-screen tiles if we exceed maxCacheSize (pin Z=0..2 overview foundation)
         let totalTiles = this.activeTiles.size + this.loadingTiles.size;
         while (totalTiles > this.maxCacheSize) {
@@ -1265,6 +1354,7 @@ export class PMTilesClient {
                 buffers: copies,
                 requestedColumns: this.requestedColumns,
                 pooledColumns,
+                colOrigins: this.colOrigins,
             };
             this.dispatchToWorker(payload, transferables, signal);
         });

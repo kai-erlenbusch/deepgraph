@@ -231,6 +231,25 @@ fn map_linear(val: f32, domMin: f32, domMax: f32, rangeMin: f32, rangeMax: f32) 
     return mix(rangeMin, rangeMax, t);
 }
 
+fn project_non_spatial_rtc(
+    val: f32,
+    domMin: f32,
+    domMax: f32,
+    rtcAnchor: f32,
+    rtcScale: f32,
+    isLiteral: bool
+) -> f32 {
+    let effVal = select(
+        clamp(val, min(domMin, domMax), max(domMin, domMax)),
+        val,
+        isLiteral
+    );
+    if (rtcScale == 0.0) {
+        return rtcAnchor;
+    }
+    return (effVal - rtcAnchor) * rtcScale;
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let localIdx = gid.x;
@@ -244,6 +263,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let xIsY16 = (u.flags & 4096u) != 0u;
     let yIsX16 = (u.flags & 8192u) != 0u;
     let isTransitioning = (u.extraFlags & 65536u) != 0u;
+    let isXLiteral = (u.extraFlags & (1u << 21u)) != 0u;
+    let isYLiteral = (u.extraFlags & (1u << 22u)) != 0u;
+    let prevIsXLiteral = (u.extraFlags & (1u << 23u)) != 0u;
+    let prevIsYLiteral = (u.extraFlags & (1u << 24u)) != 0u;
+    let hasColorBuf = (u.extraFlags & (1u << 25u)) != 0u;
+    let hasSizeBuf = (u.extraFlags & (1u << 26u)) != 0u;
+    let hasXBuf = (u.extraFlags & (1u << 27u)) != 0u;
+    let hasYBuf = (u.extraFlags & (1u << 28u)) != 0u;
+    let hasPrevXBuf = (u.extraFlags & (1u << 29u)) != 0u;
+    let hasPrevYBuf = (u.extraFlags & (1u << 30u)) != 0u;
 
     let xyPacked = xyBuf[i];
     let rawX = f32(xyPacked & 0xFFFFu) / 65535.0;
@@ -264,7 +293,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     // Visibility parity with ComputeRasterizer: never pick culled/invisible rows
-    let rawSize = sizeBuf[i];
+    var rawSize = 0.0;
+    if (hasSizeBuf) {
+        rawSize = sizeBuf[i];
+    }
     if (u.mode == 0u || u.mode == 3u) {
         if (!(rawSize == rawSize)) {
             return;
@@ -277,7 +309,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let colorSrc = (u.flags >> 14u) & 3u;
     let isCatMode = (u.mode == 1u) && ((u.flags & 4u) != 0u);
-    if (u.mode == 1u && !isCatMode && colorSrc == 0u) {
+    if (u.mode == 1u && !isCatMode && colorSrc == 0u && hasColorBuf) {
         let cv = colorBuf[i];
         if (!(cv == cv)) {
             return;
@@ -285,9 +317,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if (u.mode == 2u) {
         let metricType = (u.extraFlags >> 8u) & 15u;
-        if (metricType == 0u || metricType == 5u) {
+        if (metricType == 0u || metricType == 5u || metricType == 6u) {
+            if (!hasColorBuf) {
+                return;
+            }
             let cv = colorBuf[i];
-            if (!(cv == cv) || (metricType == 0u && cv <= 0.0 && u.colorMin > 100.0)) {
+            if (!(cv == cv) || (metricType == 6u && cv <= 0.0)) {
                 return;
             }
         }
@@ -303,22 +338,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (isXSpatial) {
         relWorldX = u.rtcBaseX + select(subX, subY, xIsY16) * u.rtcStepX;
     } else {
+        if (!hasXBuf) {
+            return;
+        }
         let xv = xBuf[i];
         if (!(xv == xv)) {
             return;
         }
-        relWorldX = map_linear(xv, u.xDomMin, u.xDomMax, u.xRangeMin, u.xRangeMax) - u.camLeft;
+        relWorldX = project_non_spatial_rtc(
+            xv,
+            u.xDomMin,
+            u.xDomMax,
+            u.rtcBaseX,
+            u.rtcStepX,
+            isXLiteral
+        );
     }
 
     var fromTopY = 0.0;
     if (isYSpatial) {
         fromTopY = u.rtcBaseY + select(subY, subX, yIsX16) * u.rtcStepY;
     } else {
+        if (!hasYBuf) {
+            return;
+        }
         let yv = yBuf[i];
         if (!(yv == yv)) {
             return;
         }
-        fromTopY = u.camTop - map_linear(yv, u.yDomMin, u.yDomMax, u.yRangeMin, u.yRangeMax);
+        fromTopY = project_non_spatial_rtc(
+            yv,
+            u.yDomMin,
+            u.yDomMax,
+            u.rtcBaseY,
+            u.rtcStepY,
+            isYLiteral
+        );
     }
 
     if (isTransitioning) {
@@ -331,22 +386,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (prevIsXSpatial) {
             prevRelX = u.prevRtcBaseX + select(subX, subY, prevXIsY16) * u.prevRtcStepX;
         } else {
+            if (!hasPrevXBuf) {
+                return;
+            }
             let pxv = prevXBuf[i];
             if (!(pxv == pxv)) {
                 return;
             }
-            prevRelX = map_linear(pxv, u.prevXDomMin, u.prevXDomMax, u.prevXRangeMin, u.prevXRangeMax) - u.camLeft;
+            prevRelX = project_non_spatial_rtc(
+                pxv,
+                u.prevXDomMin,
+                u.prevXDomMax,
+                u.prevRtcBaseX,
+                u.prevRtcStepX,
+                prevIsXLiteral
+            );
         }
 
         var prevFromTopY = 0.0;
         if (prevIsYSpatial) {
             prevFromTopY = u.prevRtcBaseY + select(subY, subX, prevYIsX16) * u.prevRtcStepY;
         } else {
+            if (!hasPrevYBuf) {
+                return;
+            }
             let pyv = prevYBuf[i];
             if (!(pyv == pyv)) {
                 return;
             }
-            prevFromTopY = u.camTop - map_linear(pyv, u.prevYDomMin, u.prevYDomMax, u.prevYRangeMin, u.prevYRangeMax);
+            prevFromTopY = project_non_spatial_rtc(
+                pyv,
+                u.prevYDomMin,
+                u.prevYDomMax,
+                u.prevRtcBaseY,
+                u.prevRtcStepY,
+                prevIsYLiteral
+            );
         }
 
         relWorldX = mix(prevRelX, relWorldX, u.transitionT);
@@ -429,10 +504,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         isYAxis: boolean,
         camLeftOrTop: number
     ): { base: number; step: number } {
-        const isY16 = axis.field === 'y_u16';
-        const tileOff = isY16 ? tileOffsetY : tileOffsetX;
+        const isSpatial = axis.field === 'x_u16' || axis.field === 'y_u16';
         const domSpan = axis.domain[1] - axis.domain[0];
         const safeDomSpan = Math.abs(domSpan) < 1e-12 ? 1.0 : domSpan;
+        if (!isSpatial) {
+            const worldSpan = axis.range[1] - axis.range[0];
+            if (Math.abs(worldSpan) < 1e-12) {
+                return {
+                    base: isYAxis ? camLeftOrTop - axis.range[0] : axis.range[0] - camLeftOrTop,
+                    step: 0.0,
+                };
+            }
+            const worldScale = worldSpan / safeDomSpan;
+            const camAnchorData = axis.domain[0] + (camLeftOrTop - axis.range[0]) / worldScale;
+            return {
+                base: camAnchorData,
+                step: isYAxis ? -worldScale : worldScale,
+            };
+        }
+
+        const isY16 = axis.field === 'y_u16';
+        const tileOff = isY16 ? tileOffsetY : tileOffsetX;
         const worldScale = (axis.range[1] - axis.range[0]) / safeDomSpan;
         const worldTile0 = axis.range[0] + (tileOff - axis.domain[0]) * worldScale;
 
@@ -581,23 +673,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const colorField = isOptical ? optColorField : cfg.color.field;
         const sizeField = isOptical ? magField : cfg.size.field;
 
-        const isXSpatial =
-            xAxis.field === 'x_u16' || xAxis.field === 'y_u16' || xAxis.transform === 'literal';
-        const isYSpatial =
-            yAxis.field === 'y_u16' || yAxis.field === 'x_u16' || yAxis.transform === 'literal';
+        const isXSpatial = xAxis.field === 'x_u16' || xAxis.field === 'y_u16';
+        const isYSpatial = yAxis.field === 'y_u16' || yAxis.field === 'x_u16';
+        const isXLiteral = !isXSpatial && xAxis.transform === 'literal';
+        const isYLiteral = !isYSpatial && yAxis.transform === 'literal';
         const xIsY16 = xAxis.field === 'y_u16';
         const yIsX16 = yAxis.field === 'x_u16';
 
         const isTransitioning =
             tileStore.isTransitioning && !isOptical && computeMode !== 3 && computeMode !== 4;
-        const prevIsXSpatial =
-            prevCfg.x.field === 'x_u16' ||
-            prevCfg.x.field === 'y_u16' ||
-            prevCfg.x.transform === 'literal';
-        const prevIsYSpatial =
-            prevCfg.y.field === 'y_u16' ||
-            prevCfg.y.field === 'x_u16' ||
-            prevCfg.y.transform === 'literal';
+        const prevIsXSpatial = prevCfg.x.field === 'x_u16' || prevCfg.x.field === 'y_u16';
+        const prevIsYSpatial = prevCfg.y.field === 'y_u16' || prevCfg.y.field === 'x_u16';
+        const prevIsXLiteral = !prevIsXSpatial && prevCfg.x.transform === 'literal';
+        const prevIsYLiteral = !prevIsYSpatial && prevCfg.y.transform === 'literal';
         const prevXIsY16 = prevCfg.x.field === 'y_u16';
         const prevYIsX16 = prevCfg.y.field === 'x_u16';
 
@@ -617,12 +705,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             (sizeSrc << 16);
 
         const extraFlags =
-            ((tileStore.metricType & 15) << 8) |
-            (isTransitioning ? 65536 : 0) |
-            (prevIsXSpatial ? 131072 : 0) |
-            (prevIsYSpatial ? 262144 : 0) |
-            (prevXIsY16 ? 524288 : 0) |
-            (prevYIsX16 ? 1048576 : 0);
+            (((tileStore.metricType & 15) << 8) |
+                (isTransitioning ? 65536 : 0) |
+                (prevIsXSpatial ? 131072 : 0) |
+                (prevIsYSpatial ? 262144 : 0) |
+                (prevXIsY16 ? 524288 : 0) |
+                (prevYIsX16 ? 1048576 : 0) |
+                (isXLiteral ? 1 << 21 : 0) |
+                (isYLiteral ? 1 << 22 : 0) |
+                (prevIsXLiteral ? 1 << 23 : 0) |
+                (prevIsYLiteral ? 1 << 24 : 0)) >>>
+            0;
 
         const zoomT = Math.max(0.0, Math.min(1.0, this.rendererWrapper.zoomT));
         const logZoom = Math.max(0.0, this.rendererWrapper.logZoom);
@@ -653,6 +746,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bestOverall: {
             slotIndex: number;
             tileKey: string;
+            expectedXyBuf: GPUBuffer;
             z: number;
             x: number;
             y: number;
@@ -667,6 +761,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (let chunkIdx = 0; chunkIdx < maxChunks; chunkIdx++) {
             const rowBaseOffset = chunkIdx * MAX_ROWS_PER_CHUNK;
             const dispatches: { slot: number; bindGroup: GPUBindGroup; workgroups: number }[] = [];
+            const dispatchedSnapshots = new Map<
+                number,
+                { key: string; xyBuf: GPUBuffer; activeRows: number }
+            >();
             let maxSlotWritten = 0;
 
             for (let slotIdx = 0; slotIdx < limitSlots; slotIdx++) {
@@ -792,10 +890,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 this.uniformU32[base + 30] = flags;
                 this.uniformU32[base + 31] = slotIdx;
 
+                const slotBufFlags =
+                    (colorBuf !== dummy ? 1 << 25 : 0) |
+                    (sizeBuf !== dummy ? 1 << 26 : 0) |
+                    (xBuf !== dummy ? 1 << 27 : 0) |
+                    (yBuf !== dummy ? 1 << 28 : 0) |
+                    (prevXBuf !== dummy ? 1 << 29 : 0) |
+                    (prevYBuf !== dummy ? 1 << 30 : 0);
+
                 this.uniformF32[base + 32] = zoomT;
                 this.uniformF32[base + 33] = effectiveHalfWindowCssPx;
                 this.uniformF32[base + 34] = tileStore.transitionT;
-                this.uniformU32[base + 35] = extraFlags;
+                this.uniformU32[base + 35] = (extraFlags | slotBufFlags) >>> 0;
 
                 this.uniformF32[base + 36] = rtcX.base;
                 this.uniformF32[base + 37] = rtcX.step;
@@ -855,6 +961,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     bindGroup,
                     workgroups: Math.ceil(chunkRows / 256),
                 });
+                dispatchedSnapshots.set(slotIdx, {
+                    key: slotObj.key,
+                    xyBuf,
+                    activeRows: slotObj.activeRows,
+                });
                 maxSlotWritten = slotIdx;
             }
 
@@ -909,15 +1020,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (let slotIdx = 0; slotIdx < limitSlots; slotIdx++) {
                 const w = words[slotIdx];
                 if (w === NO_HIT_SENTINEL || w === undefined) continue;
+                const snap = dispatchedSnapshots.get(slotIdx);
+                if (!snap) continue;
                 const slotObj = tileStore.slots[slotIdx];
-                if (!slotObj) continue;
+                if (
+                    !slotObj ||
+                    slotObj.key !== snap.key ||
+                    slotObj.buffers.get('xy_u16') !== snap.xyBuf
+                ) {
+                    continue;
+                }
 
                 const dist16th = w >>> 20;
                 const localIdx = w & 0xfffff;
                 const rawRowIdx = rowBaseOffset + localIdx;
-                if (rawRowIdx >= slotObj.activeRows) continue;
+                if (rawRowIdx >= slotObj.activeRows || rawRowIdx >= snap.activeRows) continue;
 
-                const [zStr, xStr, yStr] = slotObj.key.split('/');
+                const [zStr, xStr, yStr] = snap.key.split('/');
                 const z = parseInt(zStr, 10);
                 const x = parseInt(xStr, 10);
                 const y = parseInt(yStr, 10);
@@ -936,7 +1055,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (isBetter) {
                     bestOverall = {
                         slotIndex: slotIdx,
-                        tileKey: slotObj.key,
+                        tileKey: snap.key,
+                        expectedXyBuf: snap.xyBuf,
                         z,
                         x,
                         y,
@@ -959,7 +1079,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const winnerXyBuf = winnerSlot?.buffers.get('xy_u16');
         const byteOff = bestOverall.rawRowIdx * 4;
 
-        if (winnerSlot && winnerXyBuf && byteOff + 4 <= winnerXyBuf.size) {
+        if (
+            !winnerSlot ||
+            winnerSlot.key !== bestOverall.tileKey ||
+            winnerXyBuf !== bestOverall.expectedXyBuf ||
+            !winnerXyBuf ||
+            byteOff + 4 > winnerXyBuf.size
+        ) {
+            return null;
+        }
+
+        {
             this.device.queue.writeBuffer(this.winnerCoordBuffer, 0, this.zeroCoordReset);
             const copyEnc = this.device.createCommandEncoder({
                 label: 'PickingLayer_WinnerCoordCopy',
@@ -1000,16 +1130,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 return null;
             }
+            const postSlot = tileStore.slots[bestOverall.slotIndex];
+            if (
+                !postSlot ||
+                postSlot.key !== bestOverall.tileKey ||
+                postSlot.buffers.get('xy_u16') !== bestOverall.expectedXyBuf
+            ) {
+                this.winnerCoordBuffer.unmap();
+                return null;
+            }
             const mapped = this.winnerCoordBuffer.getMappedRange(0, WINNER_COORD_READBACK_BYTES);
             const u32 = new Uint32Array(mapped);
             const f32 = new Float32Array(mapped);
             const packedXY = u32[0] ?? 0;
             xU16 = packedXY & 0xffff;
             yU16 = (packedXY >>> 16) & 0xffff;
-            if (copyXField && wXBuf) gpuAxisAttributes[copyXField] = f32[1];
-            if (copyYField && wYBuf) gpuAxisAttributes[copyYField] = f32[2];
-            if (copyPrevXField && wPrevXBuf) gpuAxisAttributes[copyPrevXField] = f32[3];
-            if (copyPrevYField && wPrevYBuf) gpuAxisAttributes[copyPrevYField] = f32[4];
+            if (copyXField && wXBuf) {
+                gpuAxisAttributes[copyXField] = f32[1] + (tileStore.colOrigins[copyXField] ?? 0);
+            }
+            if (copyYField && wYBuf) {
+                gpuAxisAttributes[copyYField] = f32[2] + (tileStore.colOrigins[copyYField] ?? 0);
+            }
+            if (copyPrevXField && wPrevXBuf) {
+                gpuAxisAttributes[copyPrevXField] =
+                    f32[3] + (tileStore.colOrigins[copyPrevXField] ?? 0);
+            }
+            if (copyPrevYField && wPrevYBuf) {
+                gpuAxisAttributes[copyPrevYField] =
+                    f32[4] + (tileStore.colOrigins[copyPrevYField] ?? 0);
+            }
             this.winnerCoordBuffer.unmap();
         }
 

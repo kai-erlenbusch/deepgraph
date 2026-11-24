@@ -111,6 +111,7 @@ export class TileGpuStore {
     public rootBounds: BoundingBox;
 
     public categoricalDictionaries: Record<string, string[]> = {};
+    public colOrigins: Record<string, number> = {};
     public categoricalPalette: readonly number[] = DEFAULT_CATEGORICAL_PALETTE;
     public paletteDirty = true;
 
@@ -172,6 +173,7 @@ export class TileGpuStore {
 
     public clearDictionaries(): void {
         this.categoricalDictionaries = {};
+        this.colOrigins = {};
     }
 
     public setDictionaries(dictionaries: Record<string, string[]>): void {
@@ -244,7 +246,25 @@ export class TileGpuStore {
         };
 
         this.refreshAllSlotActiveRows();
+        for (let i = 0; i < this.maxSlots; i++) {
+            const s = this.slots[i];
+            if (s && s.visible && !this.isSlotReadyForCurrentAxes(s)) {
+                s.visible = false;
+            }
+        }
         return this.getActiveColumns(this.currentConfig);
+    }
+
+    private isSlotReadyForCurrentAxes(slot: GpuTileSlot): boolean {
+        if (slot.activeRows <= 0 || !slot.buffers.has('xy_u16')) return false;
+        const isOptical =
+            this.isOpticalPipeline || this.computeMode === 0 || this.computeMode === 3;
+        if (isOptical) return true;
+        const xf = this.currentConfig.x.field;
+        const yf = this.currentConfig.y.field;
+        if (xf && xf !== 'x_u16' && xf !== 'y_u16' && !slot.buffers.has(xf)) return false;
+        if (yf && yf !== 'y_u16' && yf !== 'x_u16' && !slot.buffers.has(yf)) return false;
+        return true;
     }
 
     private getMagBinForCutoff(maxMag: number): number {
@@ -313,7 +333,11 @@ export class TileGpuStore {
         }
     }
 
-    public updateFrameState(cameraZoom: number, nowMs = performance.now()): void {
+    public updateFrameState(
+        cameraZoom: number,
+        nowMs = performance.now(),
+        baseZoom = 1.0
+    ): void {
         this.globalTimeSec = nowMs * 0.001;
 
         if (this.isTransitioning) {
@@ -332,7 +356,8 @@ export class TileGpuStore {
             this.transitionT = 1.0;
         }
 
-        const currentZoom = Math.log2(Math.max(0.1, cameraZoom || 1.0));
+        const relZoom = (cameraZoom || 1.0) / Math.max(1e-30, baseZoom);
+        const currentZoom = Math.log2(Math.max(0.1, relZoom));
         let magOffset = 0;
         if (currentZoom <= 1.2) {
             magOffset = 0;
@@ -440,7 +465,9 @@ export class TileGpuStore {
 
             if (needsUpload && uploadedThisFrame >= 2 && performance.now() - frameStart > 8.0) {
                 if (slotIdx !== undefined && this.slots[slotIdx]) {
-                    this.slots[slotIdx]!.visible = this.slots[slotIdx]!.activeRows > 0;
+                    this.slots[slotIdx]!.visible = this.isSlotReadyForCurrentAxes(
+                        this.slots[slotIdx]!
+                    );
                 }
                 hasPendingUpdates = true;
                 continue;
@@ -515,7 +542,7 @@ export class TileGpuStore {
                 uploadedThisFrame++;
             }
 
-            slot.visible = slot.activeRows > 0 && slot.buffers.has('xy_u16');
+            slot.visible = this.isSlotReadyForCurrentAxes(slot);
         }
 
         return hasPendingUpdates;

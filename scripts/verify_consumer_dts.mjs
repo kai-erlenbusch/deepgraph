@@ -41,13 +41,24 @@ try {
     fs.symlinkSync(rootDir, nmPkgDir, 'junction');
 
     // Link runtime dependencies so a real downstream Vite consumer resolves externalized imports cleanly
-    for (const dep of ['pmtiles', 'p-queue', 'fflate', 'apache-arrow', '@bokuweb/zstd-wasm']) {
-        linkRootDep(nmRoot, dep);
+    for (const dep of [
+        'pmtiles',
+        'p-queue',
+        'fflate',
+        '@uwdata/flechette',
+        '@uwdata/wk-geojson',
+        '@bokuweb/zstd-wasm',
+    ]) {
+        if (fs.existsSync(path.join(rootDir, 'node_modules', dep))) {
+            linkRootDep(nmRoot, dep);
+        }
     }
 
     const consumerTs = `
 import {
     Deepgraph,
+    type CustomRangeSource,
+    type TileSource,
     type DeepgraphOptions,
     type DeepgraphPlot,
     type DeepgraphEncoding,
@@ -60,7 +71,20 @@ export async function mountConsumer(el: HTMLElement): Promise<DeepgraphPlot> {
     if (!Deepgraph.isSupported() || !StandaloneDeepgraph.isSupported()) {
         throw new Error('No WebGPU');
     }
+    const customSrc: CustomRangeSource = {
+        key: 'mem://fixture',
+        getBytes: async (_offset: number, length: number) => ({
+            data: new ArrayBuffer(Math.max(0, length)),
+        }),
+    };
+    const pmtilesCompatibleSrc: CustomRangeSource = {
+        getKey: () => 'mem://pmtiles-compat',
+        getBytes: customSrc.getBytes,
+    };
+    const sourceUnion: TileSource = pmtilesCompatibleSrc;
+    void sourceUnion;
     const enc: DeepgraphEncoding = {
+        x: { field: 'x_val', transform: 'literal' },
         color: { field: 'model', scale: 'viridis' },
         aggregation: 'points',
         pointSize: 1.1,
@@ -152,14 +176,14 @@ export async function mountConsumer(el: HTMLElement): Promise<DeepgraphPlot> {
         }
     );
 
-    // Check 3: Real `vite build` Consumer App importing externalized `dist/index.js` + `apache-arrow`!
+    // Check 3: Real `vite build` Consumer App importing externalized `dist/index.js` + `@uwdata/flechette`!
     const viteAppTs = `
 import { Deepgraph } from 'deepgraph';
-import { vectorFromArray } from 'apache-arrow';
+import { tableFromArrays } from '@uwdata/flechette';
 
-const sharedArrowVec = vectorFromArray([1, 2, 3]);
+const sharedTable = tableFromArrays({ v: new Int32Array([1, 2, 3]) });
 const stage = document.getElementById('stage');
-if (stage && Deepgraph.isSupported() && sharedArrowVec.length === 3) {
+if (stage && Deepgraph.isSupported() && sharedTable.numRows === 3) {
     void Deepgraph.create(stage, {
         url: '/samples/lmsys_sample.arrowtiles',
         powerPreference: 'low-power',

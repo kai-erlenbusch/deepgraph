@@ -6,6 +6,7 @@ import type {
     DatasetMetadataSummary,
     DeepgraphPreset,
     DeepgraphPresetInput,
+    TileSource,
 } from './types.ts';
 
 export interface EmbeddedViewConfig {
@@ -60,24 +61,28 @@ export class DatasetSession {
     public readonly summary: DatasetMetadataSummary;
     public readonly embeddedView: EmbeddedViewConfig;
     public readonly preset?: DeepgraphPreset;
+    public readonly colOrigins: Record<string, number>;
 
     private constructor(
         tileClient: PMTilesClient,
         summary: DatasetMetadataSummary,
         embeddedView: EmbeddedViewConfig,
+        colOrigins: Record<string, number>,
         preset?: DeepgraphPreset
     ) {
         this.tileClient = tileClient;
         this.summary = summary;
         this.embeddedView = embeddedView;
+        this.colOrigins = colOrigins;
         this.preset = preset;
     }
 
     public static async open(
-        source: string | File,
+        source: TileSource,
         options: {
             preset?: DeepgraphPresetInput;
             maxTileCache?: number;
+            signal?: AbortSignal;
             onDictionariesLoaded?: (dicts: Record<string, string[]>) => void;
             onTileUnloaded?: (tileId: string) => void;
         } = {}
@@ -85,9 +90,14 @@ export class DatasetSession {
         const {
             preset: presetInput,
             maxTileCache = 250,
+            signal,
             onDictionariesLoaded,
             onTileUnloaded,
         } = options;
+
+        if (signal?.aborted) {
+            throw new DOMException('Dataset load aborted', 'AbortError');
+        }
 
         const initialBounds: BoundingBox = { minX: -1.0, maxX: 1.0, minY: -1.0, maxY: 1.0 };
         const tileClient = new PMTilesClient(
@@ -99,7 +109,22 @@ export class DatasetSession {
             14
         );
 
-        try {
+        let onAbort: (() => void) | null = null;
+        const abortPromise = signal
+            ? new Promise<never>((_, reject) => {
+                  onAbort = () => {
+                      tileClient.destroy();
+                      reject(new DOMException('Dataset load aborted', 'AbortError'));
+                  };
+                  if (signal.aborted) {
+                      onAbort();
+                  } else {
+                      signal.addEventListener('abort', onAbort, { once: true });
+                  }
+              })
+            : null;
+
+        const openWork = async (): Promise<DatasetSession> => {
             const { header: archiveHeader, metadata } = await tileClient.getHeaderAndMetadata();
             const rawMeta: any = metadata || {};
 
@@ -166,12 +191,16 @@ export class DatasetSession {
                 : Math.max(0, Math.min(20, archiveHeader.maxZoom ?? 14));
 
             let schemaBuffer: Uint8Array | null = null;
-            if (rawMeta.arrow_schema) {
+            if (typeof rawMeta.arrow_schema === 'string' && rawMeta.arrow_schema.length > 0) {
                 const binaryString = atob(rawMeta.arrow_schema);
                 schemaBuffer = new Uint8Array(binaryString.length);
                 for (let i = 0; i < binaryString.length; i++) {
                     schemaBuffer[i] = binaryString.charCodeAt(i);
                 }
+            } else if (!isLegacyV00) {
+                throw new Error(
+                    'Missing or empty metadata.arrow_schema in ArrowTiles v0.1 archive'
+                );
             }
 
             const viewObj =
@@ -290,26 +319,36 @@ export class DatasetSession {
             }
 
             let schemaFields: string[] = [];
+            let parsedSchema: { name: string; type: string }[] = [];
             const intFieldNames = new Set<string>();
             try {
-                const schema = await tileClient.getSchema();
-                for (const f of schema) {
-                    if (/int/i.test(f.type)) {
+                parsedSchema = await tileClient.getSchema();
+                for (const f of parsedSchema) {
+                    if (/^(u?int(8|16|32|64))$/i.test(f.type)) {
                         intFieldNames.add(f.name);
                     }
                 }
-                schemaFields = schema
+                schemaFields = parsedSchema
                     .filter(
                         (f) =>
                             f.name !== 'x_u16' &&
                             f.name !== 'y_u16' &&
                             f.name !== 'z' &&
                             f.name !== 'row_id' &&
-                            !/utf8|binary/i.test(f.type)
+                            !/^(utf8|largeutf8|utf8view|binary|largebinary|binaryview|fixedsizebinary)$/i.test(
+                                f.type
+                            )
                     )
                     .map((f) => f.name);
             } catch (err) {
-                console.warn('Failed to parse schema, falling back to empty fields list', err);
+                if (!isLegacyV00) {
+                    throw new Error(
+                        `Failed to parse metadata.arrow_schema in ArrowTiles v0.1 archive: ${
+                            err instanceof Error ? err.message : String(err)
+                        }`
+                    );
+                }
+                console.warn('Failed to parse legacy v0.0 schema, falling back to empty fields list', err);
             }
 
             const discretePattern =
@@ -335,6 +374,56 @@ export class DatasetSession {
                     categories[colName] = labels;
                 }
             }
+
+            // Compute internal 1D Relative-to-Origin (`RTO`) offsets for temporal columns and
+            // narrow-span high-offset numeric columns BEFORE any tile worker decodes payloads!
+            const excludedRtoCols = new Set<string>([
+                'x_u16',
+                'y_u16',
+                'z',
+                'row_id',
+                'phot_g_mean_mag',
+                'abs_m',
+                'bp_rp',
+                'parallax',
+                'teff_gspphot',
+                'pmra',
+                'pmdec',
+                'radial_velocity',
+            ]);
+            if (preset?.experimental?.opticalColorField) {
+                excludedRtoCols.add(preset.experimental.opticalColorField);
+            }
+            for (const mf of preset?.experimental?.magnitudeFields ?? []) {
+                if (mf) excludedRtoCols.add(mf);
+            }
+            for (const af of preset?.experimental?.auxFields ?? []) {
+                if (af) excludedRtoCols.add(af);
+            }
+
+            const colOrigins: Record<string, number> = {};
+            for (const f of parsedSchema) {
+                if (excludedRtoCols.has(f.name) || categories[f.name]) continue;
+                const st = mergedStats[f.name];
+                if (
+                    !st ||
+                    st.type === 'categorical' ||
+                    !Number.isFinite(st.min) ||
+                    !Number.isFinite(st.max)
+                ) {
+                    continue;
+                }
+                const isTemporal = /^(date(32|64)?|timestamp)$/i.test(f.type);
+                const maxAbs = Math.max(Math.abs(st.min), Math.abs(st.max));
+                const isNarrowHighOffset =
+                    maxAbs > 1e5 &&
+                    st.max >= st.min &&
+                    st.max - st.min < maxAbs * 1e-3;
+                if ((isTemporal || isNarrowHighOffset) && st.min !== 0) {
+                    colOrigins[f.name] = st.min;
+                }
+            }
+            tileClient.setColOrigins(colOrigins);
 
             const candidateMagFields = preset?.experimental?.magnitudeFields ?? [];
             let magnitudeField = schemaFields[0] ?? 'x_u16';
@@ -371,10 +460,25 @@ export class DatasetSession {
                 rawMetadata: rawMeta,
             };
 
-            return new DatasetSession(tileClient, summary, embeddedView, preset);
+            return new DatasetSession(tileClient, summary, embeddedView, colOrigins, preset);
+        };
+
+        try {
+            if (abortPromise) {
+                const workPromise = openWork();
+                void workPromise.catch(() => {
+                    // Suppress late rejection after abort already destroyed tileClient
+                });
+                return await Promise.race([workPromise, abortPromise]);
+            }
+            return await openWork();
         } catch (err) {
             tileClient.destroy();
             throw err;
+        } finally {
+            if (signal && onAbort) {
+                signal.removeEventListener('abort', onAbort);
+            }
         }
     }
 

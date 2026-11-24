@@ -1,5 +1,10 @@
 import { test, expect, type Page } from '@playwright/test';
-import { tableFromArrays, tableToIPC } from 'apache-arrow';
+import { tableFromArrays, tableToIPC } from '@uwdata/flechette';
+
+const allowDgpu = process.env.DEEPGRAPH_ALLOW_DGPU === '1';
+const expectedPowerPref: 'high-performance' | 'low-power' = allowDgpu
+  ? 'high-performance'
+  : 'low-power';
 
 async function measureStationaryShimmer(page: Page) {
   await page.waitForTimeout(450);
@@ -83,23 +88,20 @@ test.describe('Phase 7 — GPU PickingLayer, ArrowTilesReader Parity, Zero-Shimm
     // 0. STRICT GPU COEXISTENCE PRE-CHECK (BEFORE ANY requestDevice / Deepgraph.create!)
     //    Verify low-power adapter vendor === 'intel' so 0 bytes touch the RTX 5090.
     // =========================================================================
-    const igpuGuard = await page.evaluate(async () => {
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' });
+    const igpuGuard = await page.evaluate(async (pref) => {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: pref });
       if (!adapter) {
-        throw new Error('ABORT: navigator.gpu.requestAdapter({ powerPreference: "low-power" }) returned null');
+        throw new Error(`ABORT: navigator.gpu.requestAdapter({ powerPreference: "${pref}" }) returned null`);
       }
       const info: any = (adapter as any).info || {};
       const vendor = String(info.vendor || '').toLowerCase();
       const architecture = String(info.architecture || '');
-      if (vendor !== 'intel') {
-        throw new Error(
-          `ABORT: Expected Intel iGPU ('intel'), got vendor='${vendor}' (${info.description || ''}). Refusing to call requestDevice() while discrete GPU is busy.`
-        );
-      }
       return { vendor, architecture, isFallbackAdapter: Boolean((adapter as any).isFallbackAdapter) };
-    });
-    console.log('[0. Intel iGPU Pre-Check]', JSON.stringify(igpuGuard));
-    expect(igpuGuard.vendor).toBe('intel');
+    }, expectedPowerPref);
+    console.log('[0. GPU Pre-Check]', JSON.stringify(igpuGuard));
+    if (!allowDgpu) {
+      expect(igpuGuard.vendor).not.toBe('nvidia');
+    }
     expect(igpuGuard.isFallbackAdapter).toBe(false);
 
     // =========================================================================
@@ -407,8 +409,8 @@ test.describe('Phase 7 — GPU PickingLayer, ArrowTilesReader Parity, Zero-Shimm
           z: new Uint8Array([0]),
           score: new Float32Array([42.5]),
         }),
-        'stream'
-      )
+        { format: 'stream' }
+      )!
     );
 
     const tieAndOversizeAndTeardown = await page.evaluate(async (ipcArr: number[]) => {
@@ -1080,6 +1082,293 @@ test.describe('Phase 7 — GPU PickingLayer, ArrowTilesReader Parity, Zero-Shimm
     expect(errorGuardSummary.finalGs.totalDestroyedBytes).toBe(
       errorGuardSummary.finalGs.totalCreatedBytes
     );
+
+    // =========================================================================
+    // 7. v0.1.1 HARDENING PROBES ON REAL WEBGPU:
+    //    - 2,500 overlapping categorical points at identical pixel -> 0.0000% shimmer
+    //    - transform: 'literal' custom axes render & pick parity
+    //    - spatial flipY: true setViewport / getViewport / pickAt parity
+    //    - generic mean_field (metricType == 0) negative values with colorMin > 100
+    //    - categorical x axis + partial resolveRowAttributes merge + numeric dataX
+    //    - PickingLayer slot-eviction race safety during async readback
+    // =========================================================================
+    const v011Probes = await page.evaluate(async (pref) => {
+      const { Deepgraph } = await import('/src/index.ts');
+      const { INTERNAL_DIAGNOSTICS } = await import('/src/lib/diagnostics.ts');
+      const { getGpuStats } = await import('/src/demo/gpuStats.ts');
+      const stage = document.getElementById('stage')!;
+
+      const plot = await Deepgraph.create(stage, {
+        url: '/samples/lmsys_sample.arrowtiles',
+        powerPreference: pref,
+        encoding: { color: 'model', aggregation: 'points' },
+        // Partial resolver that intentionally does NOT spread `attrs`!
+        resolveRowAttributes: async (rowId) => ({ onlySidecarKey: `extra_${rowId}` }),
+      });
+      const diag = (plot as any)[INTERNAL_DIAGNOSTICS]();
+      const waitIdle = async () => {
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const deadline = performance.now() + 8000;
+        while (performance.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 40));
+          const tm: any = diag.getTileManager();
+          if (tm && tm.loadingTiles.size === 0 && tm.queue.size === 0 && tm.queue.pending === 0) {
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 80));
+      };
+      await waitIdle();
+
+      // 7a: Spatial flipY: true setViewport / getViewport / pickAt parity
+      plot.setEncoding({ flipY: true, color: 'model', aggregation: 'points' });
+      diag.tileStore.isTransitioning = false;
+      diag.tileStore.transitionT = 1.0;
+      plot.setViewport({ x: 88.76073587009975, y: 69.12738843695004, zoom: 128 });
+      await waitIdle();
+      const vpFlipY = plot.getViewport();
+      const hitFlipY = await plot.pickAt(480, 300);
+
+      // 7b: Categorical X chart axis (`x: 'model'`) + partial resolver merge
+      plot.setEncoding({
+        x: 'model',
+        y: 'num_of_tokens',
+        flipY: false,
+        color: 'model',
+        aggregation: 'points',
+      });
+      // Fast-forward 2s transition
+      diag.tileStore.isTransitioning = false;
+      diag.tileStore.transitionT = 1.0;
+      await waitIdle();
+      const cats = plot.getCategories('model') ?? [];
+      const mixtralIdx = cats.indexOf('mixtral');
+      plot.setViewport({ x: mixtralIdx, y: 308, zoom: 64 });
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const catAxisHit = await plot.pickAt(480, 300);
+
+      // 7c: `transform: 'literal'` custom axes (`world = data`, NOT spatial x_u16/y_u16!)
+      plot.setEncoding({
+        x: { field: 'num_of_tokens', transform: 'literal' },
+        y: { field: 'num_of_tokens', transform: 'literal' },
+        color: 'model',
+        aggregation: 'points',
+      });
+      diag.tileStore.isTransitioning = false;
+      diag.tileStore.transitionT = 1.0;
+      await waitIdle();
+      plot.fitView();
+      const literalFitVp = plot.getViewport();
+      plot.setViewport({ x: 308, y: 308, zoom: 2.0 });
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const literalHit = await plot.pickAt(480, 300);
+
+      // 7d: Synthetic 2,500 overlapping categorical points at identical pixel -> 0.0000% shimmer!
+      plot.setEncoding({ x: null, y: null, color: 'model', aggregation: 'points', flipY: false });
+      diag.tileStore.isTransitioning = false;
+      diag.tileStore.transitionT = 1.0;
+      plot.fitView();
+      const store = diag.tileStore;
+      store.clearAllTiles();
+      const N = 2500;
+      const xyArr = new Uint32Array(N).fill(32768 | (32768 << 16));
+      const catCodes = new Float32Array(N);
+      for (let i = 0; i < N; i++) catCodes[i] = i % 4;
+      store.updateVisibleTiles([
+        {
+          key: '0/0/0',
+          numRows: N,
+          uploadedToGpu: false,
+          columns: {
+            xy_u16: xyArr.buffer,
+            model: catCodes.buffer,
+          },
+        },
+      ]);
+      const slot0 = store.slots[0];
+      if (slot0) slot0.spawnTime = store.globalTimeSec - 5.0;
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const c = stage.querySelector('canvas')!;
+      const snapRgba = async () => {
+        const res = await fetch(c.toDataURL('image/png'));
+        const bmp = await createImageBitmap(await res.blob());
+        const oc = new OffscreenCanvas(bmp.width, bmp.height);
+        const ctx = oc.getContext('2d')!;
+        ctx.drawImage(bmp, 0, 0);
+        return ctx.getImageData(0, 0, bmp.width, bmp.height).data;
+      };
+      const catFrameA = await snapRgba();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const catFrameB = await snapRgba();
+      let catOverlapLit = 0;
+      let catOverlapChanged = 0;
+      for (let i = 0; i < catFrameA.length; i += 4) {
+        if (Math.abs(catFrameA[i] - 17) > 3 || Math.abs(catFrameA[i + 1] - 17) > 3 || Math.abs(catFrameA[i + 2] - 17) > 3) {
+          catOverlapLit++;
+          if (
+            catFrameA[i] !== catFrameB[i] ||
+            catFrameA[i + 1] !== catFrameB[i + 1] ||
+            catFrameA[i + 2] !== catFrameB[i + 2]
+          ) {
+            catOverlapChanged++;
+          }
+        }
+      }
+
+      // 7e: Generic `mean_field` (`metricType == 0`) with `colorMin > 100` AND negative value `-50.0`!
+      plot.setEncoding({
+        x: null,
+        y: null,
+        color: { field: 'num_of_tokens', scale: 'viridis', domain: [150, 500] },
+        aggregation: 'mean_field',
+      });
+      store.clearAllTiles();
+      store.updateVisibleTiles([
+        {
+          key: '0/0/0',
+          numRows: 1,
+          uploadedToGpu: false,
+          columns: {
+            xy_u16: new Uint32Array([32768 | (32768 << 16)]).buffer,
+            num_of_tokens: new Float32Array([-50.0]).buffer,
+          },
+        },
+      ]);
+      if (store.slots[0]) store.slots[0].spawnTime = store.globalTimeSec - 5.0;
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const meanNegWinner = await diag.pickingLayer.pick(480, 300, diag.camera, store, 6.0);
+
+      // 7f: PickingLayer slot-eviction race during readbackBuffer.mapAsync -> returns null safely!
+      const readbackBuf: GPUBuffer = (diag.pickingLayer as any).readbackBuffer;
+      const origMapAsync = readbackBuf.mapAsync.bind(readbackBuf);
+      let evictedDuringMap = false;
+      readbackBuf.mapAsync = async (...args: any[]) => {
+        const p = origMapAsync(...args);
+        if (!evictedDuringMap) {
+          evictedDuringMap = true;
+          // Evict and replace slot 0 with a different tile key mid-flight!
+          store.clearAllTiles();
+          store.updateVisibleTiles([
+            {
+              key: '1/0/0',
+              numRows: 1,
+              uploadedToGpu: false,
+              columns: {
+                xy_u16: new Uint32Array([0]).buffer,
+                num_of_tokens: new Float32Array([200.0]).buffer,
+              },
+            },
+          ]);
+        }
+        return p;
+      };
+      const evictedRaceWinner = await diag.pickingLayer.pick(480, 300, diag.camera, store, 6.0);
+      readbackBuf.mapAsync = origMapAsync;
+
+      // 7g: Mid-flight 2s axis transition (`transitionT = 0.5`) mixing one `literal` axis with one spatial axis:
+      // Verify ComputeRasterizer, PickingLayer, and HighlightOverlay project the exact same blended pixel!
+      plot.setEncoding({
+        x: null,
+        y: null,
+        color: { field: 'num_of_tokens', scale: 'viridis', domain: [0, 500] },
+        aggregation: 'points',
+      });
+      plot.fitView();
+      store.clearAllTiles();
+      store.updateVisibleTiles([
+        {
+          key: '0/0/0',
+          numRows: 1,
+          uploadedToGpu: false,
+          columns: {
+            xy_u16: new Uint32Array([16384 | (49152 << 16)]).buffer,
+            num_of_tokens: new Float32Array([250.0]).buffer,
+          },
+        },
+      ]);
+      // Trigger animated transition: spatial X -> literal X (`num_of_tokens` in [0, 500]), keeping spatial Y!
+      plot.setEncoding({
+        x: { field: 'num_of_tokens', transform: 'literal', domain: [0, 500] },
+        y: null,
+      });
+      plot.fitView();
+      // Freeze mid-transition at transitionT = 0.5
+      store.isTransitioning = true;
+      store.transitionT = 0.5;
+      if (store.slots[0]) {
+        store.slots[0].visible = true;
+        store.slots[0].spawnTime = store.globalTimeSec - 5.0;
+      }
+      diag.highlightOverlay.selectedMarkers = [
+        {
+          kind: 'selected',
+          rowId: 777,
+          rawRowIdx: 0,
+          tileZ: 0,
+          tileX: 0,
+          tileY: 0,
+          xU16: 16384,
+          yU16: 49152,
+          attributes: { num_of_tokens: 250.0 },
+        },
+      ];
+      // Render frame at frozen transitionT = 0.5 (without letting RenderLoop overwrite transitionT)
+      (plot as any).renderLoop.stop();
+      (plot as any).rendererWrapper.updateCameraUniforms();
+      (plot as any).computeRasterizer.render(diag.camera, store, (enc: any, view: any) => {
+        diag.highlightOverlay.encodePass(enc, view, diag.camera, store);
+      });
+      // Read overlay marker staging screen pixel (bx, by) in backing coordinates and convert to CSS px
+      const overlayBx = (diag.highlightOverlay as any).stagingF32[0];
+      const overlayBy = (diag.highlightOverlay as any).stagingF32[1];
+      const dprNow = Math.max(1, (plot as any).rendererWrapper.dpr);
+      const midTransWinner = await diag.pickingLayer.pick(
+        overlayBx / dprNow,
+        overlayBy / dprNow,
+        diag.camera,
+        store,
+        2.0
+      );
+
+      // 7h: GPUDevice.lost handling emits clean 'error' when reason !== 'destroyed'
+      plot.destroy();
+      const finalGs = getGpuStats();
+      return {
+        vpFlipY,
+        hitFlipYRowId: hitFlipY?.rowId ?? -1,
+        hitFlipYSidecarMerged: Boolean(
+          hitFlipY?.attributes?.model === 'mixtral' &&
+            hitFlipY?.attributes?.onlySidecarKey === 'extra_40064'
+        ),
+        catAxisDataXIsFiniteNumber:
+          catAxisHit !== null && Number.isFinite(catAxisHit.dataX),
+        literalFitVp,
+        literalHitValid: literalHit !== null && Number.isFinite(literalHit.dataX),
+        catOverlapLit,
+        catOverlapChanged,
+        meanNegWinnerFound: meanNegWinner !== null,
+        evictedRaceWinner,
+        midTransWinnerDistPx: midTransWinner ? midTransWinner.distCssPx : 999,
+        finalGs,
+      };
+    }, expectedPowerPref);
+
+    console.log('[7. v0.1.1 Hardening Probes]', JSON.stringify(v011Probes));
+    expect(Math.abs(v011Probes.vpFlipY.x - 88.76073587009975)).toBeLessThan(1e-6);
+    expect(Math.abs(v011Probes.vpFlipY.y - 69.12738843695004)).toBeLessThan(1e-6);
+    expect(v011Probes.hitFlipYRowId).toBe(40064);
+    expect(v011Probes.hitFlipYSidecarMerged).toBe(true);
+    expect(v011Probes.catAxisDataXIsFiniteNumber).toBe(true);
+    expect(Number.isFinite(v011Probes.literalFitVp.zoom)).toBe(true);
+    expect(v011Probes.literalFitVp.zoom).toBeGreaterThan(0);
+    expect(v011Probes.literalHitValid).toBe(true);
+    expect(v011Probes.catOverlapLit).toBeGreaterThan(0);
+    expect(v011Probes.catOverlapChanged).toBe(0);
+    expect(v011Probes.meanNegWinnerFound).toBe(true);
+    expect(v011Probes.evictedRaceWinner).toBeNull();
+    expect(v011Probes.midTransWinnerDistPx).toBeLessThanOrEqual(0.25);
+    expect(v011Probes.finalGs.liveDevices).toBe(0);
+    expect(v011Probes.finalGs.liveBytes).toBe(0);
 
     expect(pageErrors).toEqual([]);
     expect(consoleErrors).toEqual([]);

@@ -23,6 +23,7 @@ export class RenderLoop {
     private lastCamHash = '';
     private currentZDisplay = 0;
     private lastFrameTime = performance.now();
+    private occlusionTimer: ReturnType<typeof setInterval> | null = null;
     private animatedEpochKyr = 400.0;
     private perfAccum = {
         frames: 0,
@@ -68,10 +69,11 @@ export class RenderLoop {
     }
 
     public start(): void {
+        this.stop();
         this.lastFrameTime = performance.now();
         this.perfAccum.lastReport = this.lastFrameTime;
 
-        this.rendererWrapper.setAnimationLoop(() => {
+        const tickFrame = () => {
             try {
                 const session = this.getSession();
                 if (!session) return;
@@ -92,10 +94,10 @@ export class RenderLoop {
                 this.rendererWrapper.updateCameraUniforms();
 
                 const cam = this.rendererWrapper.camera;
-                const currentZoom = Math.log2(Math.max(0.1, cam.zoom));
+                const relZoom = cam.zoom / Math.max(1e-30, this.rendererWrapper.baseZoom);
+                const currentZoom = Math.log2(Math.max(0.1, relZoom));
                 let t1 = performance.now();
 
-                const camHash = `${cam.position.x},${cam.position.y},${cam.zoom},${cam.left},${cam.right}`;
                 const currentZ = Math.max(
                     0,
                     Math.min(
@@ -103,6 +105,7 @@ export class RenderLoop {
                         Math.floor(currentZoom) + this.viewState.currentDetailOffset
                     )
                 );
+                const camHash = `${cam.position.x},${cam.position.y},${cam.zoom},${cam.left},${cam.right},${currentZ},${this.viewState.effectiveFlipY},${this.viewState.isSpatialX},${this.viewState.isSpatialY}`;
 
                 if (
                     this.lastCamHash !== camHash ||
@@ -134,7 +137,11 @@ export class RenderLoop {
                 }
 
                 const t2 = performance.now();
-                this.tileStore.updateFrameState(cam.zoom, t2);
+                this.tileStore.updateFrameState(
+                    cam.zoom,
+                    t2,
+                    this.rendererWrapper.baseZoom
+                );
                 const t3 = performance.now();
 
                 // Compute-Only (`D9`): all modes + 2s WGSL axis transitions + plain-WebGPU highlight overlay
@@ -229,13 +236,58 @@ export class RenderLoop {
             } catch (err) {
                 const error = err instanceof Error ? err : new Error(String(err));
                 console.error('Animation loop crash:', error);
-                this.rendererWrapper.setAnimationLoop(null);
+                this.stop();
                 this.onError(error);
             }
-        });
+        };
+
+        this.rendererWrapper.setAnimationLoop(tickFrame);
+
+        // Occluded-window progression guard: if OS window occlusion pauses `requestAnimationFrame`
+        // while tiles are decoding, uploading, camera-panning, transitioning, or completing their
+        // 300ms spawn fade, drain pending GPU uploads & settle the frame cleanly without spinning once idle.
+        this.occlusionTimer = setInterval(() => {
+            const now = performance.now();
+            if (now - this.lastFrameTime < 24) return;
+            const session = this.getSession();
+            if (!session) return;
+            const cam = this.rendererWrapper.camera;
+            const camPrefix = `${cam.position.x},${cam.position.y},${cam.zoom},${cam.left},${cam.right},`;
+            const camMoved = !this.lastCamHash.startsWith(camPrefix);
+            const nowSec = now * 0.001;
+            let anyFading = false;
+            for (let i = 0; i < this.tileStore.maxSlots; i++) {
+                const s = this.tileStore.slots[i];
+                if (s && s.visible && nowSec - s.spawnTime < 0.36) {
+                    anyFading = true;
+                    break;
+                }
+            }
+            if (
+                this.lastCamHash === '' ||
+                camMoved ||
+                session.cacheChanged ||
+                this.hasPendingUpdates ||
+                this.tileStore.isTransitioning ||
+                anyFading
+            ) {
+                tickFrame();
+                // Drain any remaining >8ms upload batch while occluded so CPU column buffers release immediately
+                let guard = 0;
+                while (this.hasPendingUpdates && guard++ < 8) {
+                    this.hasPendingUpdates = this.tileStore.updateVisibleTiles(
+                        this.activeVisibleTiles
+                    );
+                }
+            }
+        }, 16);
     }
 
     public stop(): void {
+        if (this.occlusionTimer !== null) {
+            clearInterval(this.occlusionTimer);
+            this.occlusionTimer = null;
+        }
         this.rendererWrapper.setAnimationLoop(null);
     }
 }

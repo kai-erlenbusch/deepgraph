@@ -3,6 +3,7 @@ import type {
     DeepgraphPreset,
     DeepgraphPresetResolver,
     ExperimentalOptions,
+    TileSource,
     ViewOptionsPatch,
 } from '../index.ts';
 
@@ -33,9 +34,19 @@ export const GAIA_DEMO_PRESET: DeepgraphPreset = {
     },
 };
 
-export function isGaiaSourceHint(source: string | File): boolean {
-    const name = (typeof source === 'string' ? source : source.name).toLowerCase();
-    return name.includes('gaia');
+export function isGaiaSourceHint(source: TileSource): boolean {
+    let rawName = '';
+    if (typeof source === 'string') {
+        rawName = source;
+    } else if (typeof File !== 'undefined' && source instanceof File) {
+        rawName = source.name;
+    } else if ('name' in source && typeof (source as { name?: unknown }).name === 'string') {
+        rawName = String((source as { name?: string }).name);
+    } else {
+        const custom = source as { key?: string; getKey?: () => string };
+        rawName = custom.key ?? custom.getKey?.() ?? '';
+    }
+    return rawName.toLowerCase().includes('gaia');
 }
 
 export function isGaiaMetadata(rawMetadata: Record<string, any> | undefined): boolean {
@@ -169,7 +180,7 @@ export function buildScienceLensPatch(
 
     if (lens === '2. Stellar Age (FLAME / Teff Map)') {
         return makeMeanField({
-            metricType: 0,
+            metricType: 6,
             auxFields: ['', '', ''],
             colorField: 'teff_gspphot',
             colorScale: 'esa_age',

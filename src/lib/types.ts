@@ -6,6 +6,32 @@ export interface BoundingBox {
     maxY: number;
 }
 
+/**
+ * Custom random-access byte-range source (compatible with PMTiles `Source`, e.g. Jupyter/Colab
+ * `anywidget` `CommRangeSource` or custom authenticated storage adapters).
+ */
+export interface CustomRangeSource {
+    /** Stable cache key identifying this archive instance (or provide `getKey()`). */
+    key?: string;
+    /** Optional PMTiles `Source`-compatible key getter. */
+    getKey?(): string;
+    /**
+     * Optional cap on automatic PMTiles leaf-directory prefetch size in bytes
+     * (`1 MiB` default on `CustomRangeSource`, or `0` to disable prefetching).
+     */
+    maxLeafPrefetchBytes?: number;
+    /** Fetch `[offset, offset + length)` bytes from the archive. */
+    getBytes(
+        offset: number,
+        length: number,
+        signal?: AbortSignal,
+        etag?: string
+    ): Promise<{ data: ArrayBuffer; etag?: string; expires?: string; cacheControl?: string }>;
+}
+
+/** Input source accepted by `Deepgraph.create({ url })` and `plot.load(source)`. */
+export type TileSource = string | File | CustomRangeSource;
+
 /** Standard built-in color scales. */
 export type ColorScaleName =
     | 'viridis'
@@ -119,7 +145,7 @@ export interface DeepgraphPreset {
 
 export type DeepgraphPresetResolver = (
     rawMetadata: Record<string, unknown>,
-    source: string | File
+    source: TileSource
 ) => DeepgraphPreset | undefined;
 
 export type DeepgraphPresetInput = DeepgraphPreset | DeepgraphPresetResolver;
@@ -239,7 +265,7 @@ export interface TelemetrySnapshot {
     trailTimeKyr: number;
 }
 
-/** Point hit payload emitted by `'click'` and `'hover'` once GPU PickingLayer lands in Phase 7. */
+/** Point hit payload emitted by `'click'`, `'hover'`, and `plot.pickAt(...)` via the GPU `PickingLayer`. */
 export interface PointHitEvent {
     /** Row identifier (`0 .. N-1` exact IEEE-754 integer for all standard archives up to `2^53 - 1`). */
     rowId: number;
@@ -265,15 +291,15 @@ export type RowAttributeResolver = (
 ) => Promise<Record<string, unknown>> | Record<string, unknown>;
 
 export interface DeepgraphOptions {
-    /** Initial `.arrowtiles` URL or local `File` to load immediately on creation. */
-    url?: string | File;
+    /** Initial `.arrowtiles` URL, local `File`, or `CustomRangeSource` to load immediately on creation. */
+    url?: TileSource;
     /** Initial visual channel encoding. */
     encoding?: DeepgraphEncoding;
     /** Dataset preset object or `(rawMetadata, source) => DeepgraphPreset | undefined` resolver. */
     preset?: DeepgraphPresetInput;
     /** Initial Z-level overfetch offset relative to `floor(log2(zoom))` (default `2`). */
     detailOffset?: number;
-    /** Maximum decoded tiles retained in the client LRU cache (default `250`). */
+    /** Maximum decoded tiles retained in the client LRU cache (default `250`, minimum `32`). */
     maxTileCache?: number;
     /** Optional WebGPU adapter power preference (`'high-performance'` default, or `'low-power'` to prefer integrated GPUs). */
     powerPreference?: 'high-performance' | 'low-power';
@@ -309,7 +335,7 @@ export interface DeepgraphEventMap {
 }
 
 export interface DeepgraphPlot {
-    load(source: string | File, options?: LoadDatasetOptions): Promise<DatasetMetadataSummary>;
+    load(source: TileSource, options?: LoadDatasetOptions): Promise<DatasetMetadataSummary>;
     setEncoding(encoding: DeepgraphEncoding): void;
     getEncoding(): DeepgraphEncoding;
     setViewOptions(patch: ViewOptionsPatch): void;

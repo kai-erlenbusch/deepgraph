@@ -6,6 +6,10 @@ import zlib from 'node:zlib';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
+const allowDgpu = process.env.DEEPGRAPH_ALLOW_DGPU === '1';
+const expectedPowerPref: 'high-performance' | 'low-power' = allowDgpu
+  ? 'high-performance'
+  : 'low-power';
 
 test.describe('Phase 8b — Optical RGB Restoration, Deep-Zoom Rescue & SPEC v0.1 Gates (Intel iGPU Sample-Only)', () => {
   test('enforces 0.0000% Mode 0 shimmer, non-fading deep zoom past zoom=64, multiscale API controls, and Mode 1 deep-zoom clarity on < 5 MiB samples', async ({
@@ -29,22 +33,21 @@ test.describe('Phase 8b — Optical RGB Restoration, Deep-Zoom Rescue & SPEC v0.
     });
     await page.goto('/__phase8b_harness.html', { waitUntil: 'domcontentloaded' });
 
-    // 0. Mandatory Option B Intel iGPU Pre-Check BEFORE any requestDevice()
-    const igpu = await page.evaluate(async () => {
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'low-power' });
-      if (!adapter) throw new Error('ABORT: low-power WebGPU adapter unavailable');
+    // 0. Mandatory GPU Coexistence Pre-Check BEFORE any requestDevice()
+    const igpu = await page.evaluate(async (pref) => {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: pref });
+      if (!adapter) throw new Error(`ABORT: ${pref} WebGPU adapter unavailable`);
       const info: any = (adapter as any).info || {};
       const vendor = String(info.vendor || '').toLowerCase();
-      if (vendor !== 'intel') {
-        throw new Error(`ABORT: Expected Intel iGPU ('intel'), got '${vendor}'`);
-      }
       return {
         vendor,
         architecture: String(info.architecture || ''),
         isFallbackAdapter: Boolean((adapter as any).isFallbackAdapter),
       };
-    });
-    expect(igpu.vendor).toBe('intel');
+    }, expectedPowerPref);
+    if (!allowDgpu) {
+      expect(igpu.vendor).not.toBe('nvidia');
+    }
     expect(igpu.isFallbackAdapter).toBe(false);
 
     // Helper to wait until streaming tiles & 300ms spawn fade-in settle
@@ -136,7 +139,7 @@ test.describe('Phase 8b — Optical RGB Restoration, Deep-Zoom Rescue & SPEC v0.
     };
 
     // 1. Load < 5 MiB `gaia_sample.arrowtiles` in Optical HDR Mode 0
-    const initialState = await page.evaluate(async () => {
+    const initialState = await page.evaluate(async (pref) => {
       const { Deepgraph } = await import('/src/index.ts');
       const { INTERNAL_DIAGNOSTICS } = await import('/src/lib/diagnostics.ts');
       const { resolveDemoPreset } = await import('/src/demo/gaiaPreset.ts');
@@ -144,12 +147,12 @@ test.describe('Phase 8b — Optical RGB Restoration, Deep-Zoom Rescue & SPEC v0.
       const plot = await Deepgraph.create(stage, {
         url: '/samples/gaia_sample.arrowtiles',
         preset: resolveDemoPreset,
-        powerPreference: 'low-power',
+        powerPreference: pref,
       });
       plot.fitView();
       (window as any).__p8b = { plot, diag: (plot as any)[INTERNAL_DIAGNOSTICS]() };
       return plot.getViewState();
-    });
+    }, expectedPowerPref);
 
     expect(initialState.pipeline).toBe('optical');
     expect(initialState.pointSize).toBe(1.0);

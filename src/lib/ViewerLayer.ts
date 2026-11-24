@@ -20,6 +20,7 @@ import type {
     LoadDatasetOptions,
     PointHitEvent,
     RowAttributeResolver,
+    TileSource,
     ViewOptionsPatch,
     ViewportState,
     ViewStateSnapshot,
@@ -44,6 +45,7 @@ export class ViewerLayer implements DeepgraphPlot {
     private resolveRowAttributes?: RowAttributeResolver;
     private resolveRowAttributesOnHover: boolean;
     private loadGeneration = 0;
+    private activeLoadController: AbortController | null = null;
     private hoverSeq = 0;
     private lastHoverDispatchMs = 0;
     private lastHoverWasNull = true;
@@ -125,6 +127,21 @@ export class ViewerLayer implements DeepgraphPlot {
                 this.emit('error', err);
             };
             this.device.addEventListener('uncapturederror', this.boundUncapturedError);
+            if (this.device.lost && typeof this.device.lost.then === 'function') {
+                void this.device.lost.then((info: any) => {
+                    if (!this.destroyed && info?.reason !== 'destroyed') {
+                        this.renderLoop.stop();
+                        this.emit(
+                            'error',
+                            new Error(
+                                `WebGPU device lost (${info?.reason ?? 'unknown'}): ${
+                                    info?.message ?? ''
+                                }`
+                            )
+                        );
+                    }
+                });
+            }
         }
 
         this.renderLoop.start();
@@ -191,7 +208,7 @@ export class ViewerLayer implements DeepgraphPlot {
     }
 
     public async load(
-        source: string | File,
+        source: TileSource,
         options: LoadDatasetOptions = {}
     ): Promise<DatasetMetadataSummary> {
         if (this.destroyed) {
@@ -199,6 +216,13 @@ export class ViewerLayer implements DeepgraphPlot {
         }
 
         const gen = ++this.loadGeneration;
+        if (this.activeLoadController) {
+            this.activeLoadController.abort();
+            this.activeLoadController = null;
+        }
+        const loadController = new AbortController();
+        this.activeLoadController = loadController;
+
         this.clearHoverState(false);
         this.abortActivePickControllers();
         this.highlightOverlay.clear();
@@ -212,20 +236,36 @@ export class ViewerLayer implements DeepgraphPlot {
         this.renderLoop.resetViewCache();
 
         const activePreset = options.preset ?? this.defaultPreset;
-        const session = await DatasetSession.open(source, {
-            preset: activePreset,
-            maxTileCache: this.maxTileCache,
-            onDictionariesLoaded: (dicts) => {
-                if (this.destroyed || this.session !== session) return;
-                this.tileStore.setDictionaries(dicts);
-                this.viewState.syncToTileStore(this.tileStore, session, false);
-                this.emit('load', session.summary);
-            },
-            onTileUnloaded: (tileId) => {
-                if (this.destroyed || this.session !== session) return;
-                this.tileStore.unloadTile(tileId);
-            },
-        });
+        let session: DatasetSession;
+        try {
+            session = await DatasetSession.open(source, {
+                preset: activePreset,
+                maxTileCache: this.maxTileCache,
+                signal: loadController.signal,
+                onDictionariesLoaded: (dicts) => {
+                    if (this.destroyed || this.session !== session) return;
+                    this.tileStore.setDictionaries(dicts);
+                    this.viewState.syncToTileStore(this.tileStore, session, false);
+                    this.emit('load', session.summary);
+                },
+                onTileUnloaded: (tileId) => {
+                    if (this.destroyed || this.session !== session) return;
+                    this.tileStore.unloadTile(tileId);
+                },
+            });
+        } catch (err) {
+            if (this.destroyed) {
+                throw new Error('Deepgraph instance was destroyed during dataset load.');
+            }
+            if (gen !== this.loadGeneration || loadController.signal.aborted) {
+                throw new DOMException('Dataset load superseded', 'AbortError');
+            }
+            throw err;
+        } finally {
+            if (this.activeLoadController === loadController) {
+                this.activeLoadController = null;
+            }
+        }
 
         // Guard against destroy() or a newer load() arriving while DatasetSession.open() was in flight!
         if (this.destroyed || gen !== this.loadGeneration) {
@@ -238,11 +278,16 @@ export class ViewerLayer implements DeepgraphPlot {
 
         this.session = session;
         this.tileStore.setRootBounds(session.summary.rootBounds);
+        this.tileStore.colOrigins = { ...session.colOrigins };
         if (Object.keys(session.summary.categories).length > 0) {
             this.tileStore.setDictionaries(session.summary.categories);
         }
 
         this.viewState.initFromSession(session, session.preset, options.encoding);
+        this.syncCameraBaseZoom();
+        if (this.viewState.hasCustomWorldScale) {
+            this.fitView();
+        }
         this.viewState.syncToTileStore(this.tileStore, session, false);
         this.renderLoop.syncEpoch(this.viewState.snapshot().experimental.trailTimeKyr);
 
@@ -332,7 +377,7 @@ export class ViewerLayer implements DeepgraphPlot {
                 return null;
             }
             if (enriched && typeof enriched === 'object') {
-                finalAttrs = enriched;
+                finalAttrs = { ...decoded.attributes, ...enriched };
             }
         }
 
@@ -353,14 +398,20 @@ export class ViewerLayer implements DeepgraphPlot {
               ? rb.minY + yNorm * (rb.maxY - rb.minY)
               : rb.maxY - yNorm * (rb.maxY - rb.minY);
 
-        const dataX =
-            vs.xField && typeof finalAttrs[vs.xField] === 'number'
-                ? (finalAttrs[vs.xField] as number)
-                : spatialX;
-        const dataY =
-            vs.yField && typeof finalAttrs[vs.yField] === 'number'
-                ? (finalAttrs[vs.yField] as number)
-                : spatialY;
+        const resolveAxisHitCoord = (field: string | null, fallbackSpatial: number): number => {
+            if (!field) return fallbackSpatial;
+            const raw = finalAttrs[field];
+            if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+            if (typeof raw === 'string') {
+                const cats = this.tileStore.categoricalDictionaries[field];
+                const idx = cats ? cats.indexOf(raw) : -1;
+                if (idx >= 0) return idx;
+            }
+            return fallbackSpatial;
+        };
+
+        const dataX = resolveAxisHitCoord(vs.xField, spatialX);
+        const dataY = resolveAxisHitCoord(vs.yField, spatialY);
 
         const hit: PointHitEvent = {
             rowId: decoded.rowId,
@@ -376,6 +427,7 @@ export class ViewerLayer implements DeepgraphPlot {
             hit,
             marker: {
                 rowId: decoded.rowId,
+                ...(decoded.rowIdBigInt !== undefined ? { rowIdBigInt: decoded.rowIdBigInt } : {}),
                 rawRowIdx: winner.rawRowIdx,
                 tileZ: winner.z,
                 tileX: winner.x,
@@ -580,11 +632,22 @@ export class ViewerLayer implements DeepgraphPlot {
 
     public setEncoding(encoding: DeepgraphEncoding): void {
         if (!this.session || this.destroyed) return;
+        const prevSpatialX = this.viewState.isSpatialX;
+        const prevSpatialY = this.viewState.isSpatialY;
+        const prevFlip = this.viewState.effectiveFlipY;
         this.viewState.applyEncoding(
             encoding,
             this.session.summary.stats,
             this.tileStore.categoricalDictionaries
         );
+        this.syncCameraBaseZoom();
+        if (
+            this.viewState.isSpatialX !== prevSpatialX ||
+            this.viewState.isSpatialY !== prevSpatialY ||
+            this.viewState.effectiveFlipY !== prevFlip
+        ) {
+            this.session.cacheChanged = true;
+        }
         this.viewState.syncToTileStore(this.tileStore, this.session, true);
     }
 
@@ -594,6 +657,9 @@ export class ViewerLayer implements DeepgraphPlot {
 
     public setViewOptions(patch: ViewOptionsPatch): void {
         if (this.destroyed) return;
+        const prevSpatialX = this.viewState.isSpatialX;
+        const prevSpatialY = this.viewState.isSpatialY;
+        const prevFlip = this.viewState.effectiveFlipY;
         this.viewState.patch(patch);
         if (
             patch.experimental?.trailTimeKyr !== undefined ||
@@ -602,10 +668,18 @@ export class ViewerLayer implements DeepgraphPlot {
             this.renderLoop.syncEpoch(this.viewState.snapshot().experimental.trailTimeKyr);
         }
         if (!this.session) return;
-        if (patch.detailOffset !== undefined && Object.keys(patch).length === 1) {
+        if (
+            patch.detailOffset !== undefined ||
+            this.viewState.isSpatialX !== prevSpatialX ||
+            this.viewState.isSpatialY !== prevSpatialY ||
+            this.viewState.effectiveFlipY !== prevFlip
+        ) {
             this.session.cacheChanged = true;
+        }
+        if (patch.detailOffset !== undefined && Object.keys(patch).length === 1) {
             return;
         }
+        this.syncCameraBaseZoom();
         this.viewState.syncToTileStore(this.tileStore, this.session, true);
     }
 
@@ -646,9 +720,32 @@ export class ViewerLayer implements DeepgraphPlot {
         return { x: dataX, y: dataY, zoom: cam.zoom };
     }
 
+    private computeFitZoom(): number {
+        if (!this.session || !this.viewState.hasCustomWorldScale) {
+            return DEFAULT_FIT_ZOOM;
+        }
+        const cam = this.rendererWrapper.camera;
+        const frustumW = Math.max(1e-6, cam.right - cam.left);
+        const frustumH = Math.max(1e-6, cam.top - cam.bottom);
+        const m = this.viewState.resolveAxisMapping(this.session);
+        const spanX = Math.abs(m.xRange[1] - m.xRange[0]);
+        const spanY = Math.abs(m.yRange[1] - m.yRange[0]);
+        const effSpanX = spanX > 1e-9 ? spanX : spanY > 1e-9 ? spanY : frustumH;
+        const effSpanY = spanY > 1e-9 ? spanY : spanX > 1e-9 ? spanX : frustumH;
+        const fitZoom = Math.min(frustumW / effSpanX, frustumH / effSpanY) * 0.85;
+        return Number.isFinite(fitZoom) && fitZoom > 0 ? fitZoom : DEFAULT_FIT_ZOOM;
+    }
+
+    private syncCameraBaseZoom(): number {
+        const fitZoom = this.computeFitZoom();
+        this.rendererWrapper.setBaseZoom(fitZoom / DEFAULT_FIT_ZOOM);
+        return fitZoom;
+    }
+
     /** Pans/zooms the viewport from **data coordinates** `(x, y)` and magnification `zoom`. */
     public setViewport(viewport: Partial<ViewportState>): void {
         const cam = this.rendererWrapper.camera;
+        this.syncCameraBaseZoom();
 
         if (this.session) {
             const m = this.viewState.resolveAxisMapping(this.session);
@@ -674,7 +771,7 @@ export class ViewerLayer implements DeepgraphPlot {
         }
 
         if (viewport.zoom !== undefined && Number.isFinite(viewport.zoom) && viewport.zoom > 0) {
-            cam.zoom = viewport.zoom;
+            cam.zoom = this.rendererWrapper.clampZoom(viewport.zoom);
         }
         cam.updateProjectionMatrix();
         cam.updateMatrixWorld();
@@ -686,6 +783,7 @@ export class ViewerLayer implements DeepgraphPlot {
     /** Resets the camera to frame the center of the active dataset bounds. */
     public fitView(): void {
         const cam = this.rendererWrapper.camera;
+        const fitZoom = this.syncCameraBaseZoom();
         let centerX = 0.0;
         let centerY = 0.0;
         if (this.session) {
@@ -694,7 +792,7 @@ export class ViewerLayer implements DeepgraphPlot {
             centerY = 0.5 * (m.yRange[0] + m.yRange[1]);
         }
         cam.position.set(centerX, centerY, cam.position.z);
-        cam.zoom = DEFAULT_FIT_ZOOM;
+        cam.zoom = fitZoom;
         cam.updateProjectionMatrix();
         cam.updateMatrixWorld();
         if (this.session) {
@@ -754,6 +852,10 @@ export class ViewerLayer implements DeepgraphPlot {
         if (this.destroyed) return;
         this.destroyed = true;
         this.loadGeneration++;
+        if (this.activeLoadController) {
+            this.activeLoadController.abort();
+            this.activeLoadController = null;
+        }
         this.clearHoverState(false);
         this.abortActivePickControllers();
         this.renderLoop.stop();
