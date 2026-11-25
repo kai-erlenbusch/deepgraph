@@ -594,3 +594,431 @@ export function extractTileColumnsFromTables(
         dictionaries: Object.keys(dictionaries).length > 0 ? dictionaries : undefined,
     };
 }
+
+const WORKER_MASK_ROWS_PER_SLICE = 262144;
+const WORKER_MASK_WORDS_PER_SLICE = 8192; // 32,768 bytes (2,048 x vec4<u32>)
+
+export interface WorkerTileRowIndex {
+    rowIds: Uint32Array | BigUint64Array;
+    isBigInt64: boolean;
+    xU16: Uint16Array;
+    yU16: Uint16Array;
+    byteLength: number;
+}
+
+export interface WorkerSpatialQuerySpec {
+    rect?: { minX: number; maxX: number; minY: number; maxY: number } | null;
+    lasso?: ReadonlyArray<readonly [number, number]> | null;
+    dataBounds?: { min_x: number; max_x: number; min_y: number; max_y: number };
+    rootBounds: { minX: number; maxX: number; minY: number; maxY: number };
+    effectiveFlipY: boolean;
+}
+
+/**
+ * Extracts a compact per-tile `(row_id, x_u16, y_u16)` index (`Uint32Array` when all IDs fit in
+ * `0 .. 2^32 - 1`, `BigUint64Array` when any ID exceeds `2^32 - 1` such as Gaia DR3 `source_id`).
+ */
+export function extractTileRowIndexFromTables(tables: any[]): WorkerTileRowIndex | null {
+    if (!tables || tables.length === 0) return null;
+    const numRows: number = tables[0].numRows;
+    if (numRows <= 0) return null;
+
+    const getCol = (name: string): any => {
+        for (const t of tables) {
+            const c = t.getChild(name);
+            if (c) return c;
+        }
+        return null;
+    };
+
+    const copyU16 = (name: string): Uint16Array => {
+        const out = new Uint16Array(numRows);
+        const child = getCol(name);
+        if (!child || !child.data) return out;
+        let dst = 0;
+        for (const chunk of child.data) {
+            const len = Math.min(chunk.length, numRows - dst);
+            if (len <= 0) break;
+            if (chunk.values instanceof Uint16Array) {
+                out.set(chunk.values.subarray(0, len), dst);
+            } else {
+                for (let i = 0; i < len; i++) {
+                    out[dst + i] = Number(chunk.at(i) ?? 0);
+                }
+            }
+            dst += len;
+        }
+        return out;
+    };
+
+    const xU16 = copyU16('x_u16');
+    const yU16 = copyU16('y_u16');
+
+    const rowIdCol = getCol('row_id');
+    if (!rowIdCol || !rowIdCol.data || rowIdCol.data.length === 0) {
+        const seq = new Uint32Array(numRows);
+        for (let i = 0; i < numRows; i++) seq[i] = i;
+        return {
+            rowIds: seq,
+            isBigInt64: false,
+            xU16,
+            yU16,
+            byteLength: seq.byteLength + xU16.byteLength + yU16.byteLength,
+        };
+    }
+
+    let needs64 = false;
+    for (const chunk of rowIdCol.data) {
+        const vals = chunk.values;
+        if (vals instanceof BigUint64Array || vals instanceof BigInt64Array) {
+            for (let i = 0; i < chunk.length; i++) {
+                const v = vals[i];
+                if (v < 0n || v > 0xffffffffn) {
+                    needs64 = true;
+                    break;
+                }
+            }
+        } else if (vals && ArrayBuffer.isView(vals)) {
+            for (let i = 0; i < chunk.length; i++) {
+                const v = (vals as any)[i] as number;
+                if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) {
+                    needs64 = true;
+                    break;
+                }
+            }
+        } else {
+            for (let i = 0; i < chunk.length; i++) {
+                const v = chunk.at(i);
+                if (typeof v === 'bigint') {
+                    if (v < 0n || v > 0xffffffffn) {
+                        needs64 = true;
+                        break;
+                    }
+                } else if (typeof v === 'number') {
+                    if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) {
+                        needs64 = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (needs64) break;
+    }
+
+    if (!needs64) {
+        const u32 = new Uint32Array(numRows);
+        let dst = 0;
+        for (const chunk of rowIdCol.data) {
+            const len = Math.min(chunk.length, numRows - dst);
+            if (len <= 0) break;
+            const vals = chunk.values;
+            if (vals instanceof Uint32Array) {
+                u32.set(vals.subarray(0, len), dst);
+            } else if (vals instanceof BigUint64Array || vals instanceof BigInt64Array) {
+                for (let i = 0; i < len; i++) u32[dst + i] = Number(vals[i]);
+            } else {
+                for (let i = 0; i < len; i++) u32[dst + i] = Number(chunk.at(i) ?? 0) >>> 0;
+            }
+            dst += len;
+        }
+        return {
+            rowIds: u32,
+            isBigInt64: false,
+            xU16,
+            yU16,
+            byteLength: u32.byteLength + xU16.byteLength + yU16.byteLength,
+        };
+    }
+
+    const u64 = new BigUint64Array(numRows);
+    let dst = 0;
+    for (const chunk of rowIdCol.data) {
+        const len = Math.min(chunk.length, numRows - dst);
+        if (len <= 0) break;
+        const vals = chunk.values;
+        if (vals instanceof BigUint64Array) {
+            u64.set(vals.subarray(0, len), dst);
+        } else if (vals instanceof BigInt64Array) {
+            for (let i = 0; i < len; i++) u64[dst + i] = BigInt.asUintN(64, vals[i]);
+        } else {
+            for (let i = 0; i < len; i++) {
+                const v = chunk.at(i);
+                if (typeof v === 'bigint') {
+                    u64[dst + i] = BigInt.asUintN(64, v);
+                } else if (typeof v === 'number' && Number.isFinite(v)) {
+                    u64[dst + i] = BigInt.asUintN(64, BigInt(Math.trunc(v)));
+                }
+            }
+        }
+        dst += len;
+    }
+    return {
+        rowIds: u64,
+        isBigInt64: true,
+        xU16,
+        yU16,
+        byteLength: u64.byteLength + xU16.byteLength + yU16.byteLength,
+    };
+}
+
+function binarySearchU32(sorted: Uint32Array, target: number): boolean {
+    let lo = 0;
+    let hi = sorted.length - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >>> 1;
+        const v = sorted[mid];
+        if (v === target) return true;
+        if (v < target) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return false;
+}
+
+function binarySearchU64(sorted: BigUint64Array, target: bigint): boolean {
+    let lo = 0;
+    let hi = sorted.length - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >>> 1;
+        const v = sorted[mid];
+        if (v === target) return true;
+        if (v < target) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return false;
+}
+
+/**
+ * Compiles `1 .. ceil(numRows / 262144)` `32,768`-byte `SlotVisibilityMask` slices
+ * (`vec4<u32>`-aligned in WGSL) by binary-searching a sorted `Uint32Array` or `BigUint64Array`.
+ */
+export function compileSlotBitmaskSlices(
+    index: WorkerTileRowIndex,
+    sortedU32: Uint32Array | null,
+    sortedU64: BigUint64Array | null
+): ArrayBuffer[] {
+    const numRows = index.rowIds.length;
+    const numSlices = Math.max(1, Math.ceil(numRows / WORKER_MASK_ROWS_PER_SLICE));
+    const slices: ArrayBuffer[] = [];
+    const hasU32Set = Boolean(sortedU32 && sortedU32.length > 0);
+    const hasU64Set = Boolean(sortedU64 && sortedU64.length > 0);
+
+    for (let s = 0; s < numSlices; s++) {
+        const buf = new ArrayBuffer(WORKER_MASK_WORDS_PER_SLICE * 4);
+        const words = new Uint32Array(buf);
+        if (hasU32Set || hasU64Set) {
+            const rowBase = s * WORKER_MASK_ROWS_PER_SLICE;
+            const count = Math.min(WORKER_MASK_ROWS_PER_SLICE, numRows - rowBase);
+            if (!index.isBigInt64) {
+                const ids32 = index.rowIds as Uint32Array;
+                if (hasU32Set) {
+                    const set32 = sortedU32!;
+                    for (let localI = 0; localI < count; localI++) {
+                        if (binarySearchU32(set32, ids32[rowBase + localI])) {
+                            words[localI >>> 5] |= (1 << (localI & 31)) >>> 0;
+                        }
+                    }
+                } else {
+                    const set64 = sortedU64!;
+                    for (let localI = 0; localI < count; localI++) {
+                        if (binarySearchU64(set64, BigInt(ids32[rowBase + localI]))) {
+                            words[localI >>> 5] |= (1 << (localI & 31)) >>> 0;
+                        }
+                    }
+                }
+            } else {
+                const ids64 = index.rowIds as BigUint64Array;
+                if (hasU64Set) {
+                    const set64 = sortedU64!;
+                    for (let localI = 0; localI < count; localI++) {
+                        if (binarySearchU64(set64, ids64[rowBase + localI])) {
+                            words[localI >>> 5] |= (1 << (localI & 31)) >>> 0;
+                        }
+                    }
+                } else {
+                    const set32 = sortedU32!;
+                    for (let localI = 0; localI < count; localI++) {
+                        const v = ids64[rowBase + localI];
+                        if (v <= 0xffffffffn && binarySearchU32(set32, Number(v))) {
+                            words[localI >>> 5] |= (1 << (localI & 31)) >>> 0;
+                        }
+                    }
+                }
+            }
+        }
+        slices.push(buf);
+    }
+    return slices;
+}
+
+function pointInPolyWorker(
+    px: number,
+    py: number,
+    verts: ReadonlyArray<readonly [number, number]>
+): boolean {
+    const n = verts.length;
+    if (n < 3) return false;
+    let inside = false;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+        const xi = verts[i][0];
+        const yi = verts[i][1];
+        const xj = verts[j][0];
+        const yj = verts[j][1];
+        if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+function pcgHashWorker(vIn: number): number {
+    const state = (Math.imul(vIn >>> 0, 747796405) + 2891336453) >>> 0;
+    const shift = ((state >>> 28) + 4) >>> 0;
+    const word = Math.imul((state >>> shift) ^ state, 277803737) >>> 0;
+    const res = ((word >>> 22) ^ word) >>> 0;
+    return res / 4294967295.0;
+}
+
+/**
+ * Binary-searches a small probe vector (`<= 64` pinned `HighlightOverlay` markers) against
+ * the worker's sorted `row_id` filter without allocating any main-thread `Set<bigint>`.
+ */
+export function testProbeRowIdsInFilter(
+    probeIds: BigUint64Array,
+    sortedU32: Uint32Array | null,
+    sortedU64: BigUint64Array | null
+): Uint8Array {
+    const out = new Uint8Array(probeIds.length);
+    const hasU32 = Boolean(sortedU32 && sortedU32.length > 0);
+    const hasU64 = Boolean(sortedU64 && sortedU64.length > 0);
+    if (!hasU32 && !hasU64) return out;
+
+    for (let i = 0; i < probeIds.length; i++) {
+        const v = probeIds[i];
+        if (hasU64) {
+            out[i] = binarySearchU64(sortedU64!, v) ? 1 : 0;
+        } else if (v <= 0xffffffffn) {
+            out[i] = binarySearchU32(sortedU32!, Number(v)) ? 1 : 0;
+        }
+    }
+    return out;
+}
+
+/** Evaluates a committed spatial `rect` or `lasso` query against a cached tile's `row_id`s in a worker. */
+export function queryTileSpatialSelection(
+    tileKey: string,
+    index: WorkerTileRowIndex,
+    spec: WorkerSpatialQuerySpec,
+    hasActiveFilter = false,
+    sortedU32: Uint32Array | null = null,
+    sortedU64: BigUint64Array | null = null
+): BigUint64Array {
+    const [zStr, txStr, tyStr] = tileKey.split('/');
+    const z = parseInt(zStr, 10);
+    const tx = parseInt(txStr, 10);
+    const ty = parseInt(tyStr, 10);
+    const scale = Math.pow(0.5, z);
+    const tileOffX = tx * scale;
+    const tileOffY = ty * scale;
+
+    const db = spec.dataBounds;
+    const rb = spec.rootBounds;
+    const effFlip = spec.effectiveFlipY;
+
+    const mapX = (normX: number): number =>
+        db ? db.min_x + normX * (db.max_x - db.min_x) : rb.minX + normX * (rb.maxX - rb.minX);
+    const mapY = (normY: number): number =>
+        db
+            ? db.max_y - normY * (db.max_y - db.min_y)
+            : effFlip
+              ? rb.minY + normY * (rb.maxY - rb.minY)
+              : rb.maxY - normY * (rb.maxY - rb.minY);
+
+    let aabbMinX = -Infinity;
+    let aabbMaxX = Infinity;
+    let aabbMinY = -Infinity;
+    let aabbMaxY = Infinity;
+
+    if (spec.rect) {
+        aabbMinX = Math.max(aabbMinX, Math.min(spec.rect.minX, spec.rect.maxX));
+        aabbMaxX = Math.min(aabbMaxX, Math.max(spec.rect.minX, spec.rect.maxX));
+        aabbMinY = Math.max(aabbMinY, Math.min(spec.rect.minY, spec.rect.maxY));
+        aabbMaxY = Math.min(aabbMaxY, Math.max(spec.rect.minY, spec.rect.maxY));
+    }
+
+    const lasso = spec.lasso && spec.lasso.length >= 3 ? spec.lasso : null;
+    if (lasso) {
+        let lMinX = Infinity;
+        let lMaxX = -Infinity;
+        let lMinY = Infinity;
+        let lMaxY = -Infinity;
+        for (const [lx, ly] of lasso) {
+            if (lx < lMinX) lMinX = lx;
+            if (lx > lMaxX) lMaxX = lx;
+            if (ly < lMinY) lMinY = ly;
+            if (ly > lMaxY) lMaxY = ly;
+        }
+        aabbMinX = Math.max(aabbMinX, lMinX);
+        aabbMaxX = Math.min(aabbMaxX, lMaxX);
+        aabbMinY = Math.max(aabbMinY, lMinY);
+        aabbMaxY = Math.min(aabbMaxY, lMaxY);
+    }
+
+    // Tile-level AABB early-out (with 2-ulp u16 jitter margin)
+    const padNorm = (2.0 / 65535.0) * scale;
+    const tX0 = mapX(tileOffX - padNorm);
+    const tX1 = mapX(tileOffX + scale + padNorm);
+    const tY0 = mapY(tileOffY - padNorm);
+    const tY1 = mapY(tileOffY + scale + padNorm);
+    if (
+        Math.max(tX0, tX1) < aabbMinX ||
+        Math.min(tX0, tX1) > aabbMaxX ||
+        Math.max(tY0, tY1) < aabbMinY ||
+        Math.min(tY0, tY1) > aabbMaxY
+    ) {
+        return new BigUint64Array(0);
+    }
+
+    const hits: bigint[] = [];
+    const n = index.rowIds.length;
+    const xArr = index.xU16;
+    const yArr = index.yU16;
+    const is64 = index.isBigInt64;
+    const ids32 = !is64 ? (index.rowIds as Uint32Array) : null;
+    const ids64 = is64 ? (index.rowIds as BigUint64Array) : null;
+    const hasU32Set = Boolean(sortedU32 && sortedU32.length > 0);
+    const hasU64Set = Boolean(sortedU64 && sortedU64.length > 0);
+
+    if (hasActiveFilter && !hasU32Set && !hasU64Set) {
+        return new BigUint64Array(0);
+    }
+
+    for (let i = 0; i < n; i++) {
+        if (hasActiveFilter) {
+            if (!is64) {
+                const rid32 = ids32![i];
+                const ok = hasU32Set
+                    ? binarySearchU32(sortedU32!, rid32)
+                    : binarySearchU64(sortedU64!, BigInt(rid32));
+                if (!ok) continue;
+            } else {
+                const rid64 = ids64![i];
+                const ok = hasU64Set
+                    ? binarySearchU64(sortedU64!, rid64)
+                    : rid64 <= 0xffffffffn && binarySearchU32(sortedU32!, Number(rid64));
+                if (!ok) continue;
+            }
+        }
+        const subX = (xArr[i] + (pcgHashWorker(i) - 0.5)) / 65535.0;
+        const subY = (yArr[i] + (pcgHashWorker(i + 12345) - 0.5)) / 65535.0;
+        const dx = mapX(tileOffX + subX * scale);
+        if (dx < aabbMinX || dx > aabbMaxX) continue;
+        const dy = mapY(tileOffY + subY * scale);
+        if (dy < aabbMinY || dy > aabbMaxY) continue;
+        if (lasso && !pointInPolyWorker(dx, dy, lasso)) continue;
+        hits.push(is64 ? ids64![i] : BigInt(ids32![i]));
+    }
+
+    const out = new BigUint64Array(hits.length);
+    for (let i = 0; i < hits.length; i++) out[i] = hits[i];
+    return out;
+}

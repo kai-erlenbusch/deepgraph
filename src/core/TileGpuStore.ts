@@ -92,6 +92,9 @@ export class TileGpuStore {
     public auxField1 = '';
     public auxField2 = '';
     public auxField3 = '';
+    /** Optional unmapped filter columns bound into idle `@binding(4)` / `@binding(5)` on spatial maps (`Step 3A`). */
+    public filterExtraField1 = '';
+    public filterExtraField2 = '';
     public trailMode = 0;
     public trailTimeKyr = 400.0;
     public minParallax = 8.0;
@@ -116,7 +119,9 @@ export class TileGpuStore {
     public paletteDirty = true;
 
     private onReleaseCpuTileBuffers?: (tile: TileData) => void;
+    public onSlotBindingsInvalidated?: (slot: number) => void;
     public onSlotDisposed?: (slot: number) => void;
+    public onSlotMaskUploaded?: (slot: number, maskSlices: ReadonlyArray<ArrayBuffer>) => void;
 
     /** @internal Diagnostic flag used strictly by the Phase 6 negative-control VRAM leak test. */
     public debugSkipBufferDestroy = false;
@@ -199,6 +204,8 @@ export class TileGpuStore {
         addIfColumn(this.auxField1);
         addIfColumn(this.auxField2);
         addIfColumn(this.auxField3);
+        addIfColumn(this.filterExtraField1);
+        addIfColumn(this.filterExtraField2);
 
         if (this.isTransitioning) {
             addIfColumn(this.previousConfig.x.field);
@@ -264,6 +271,8 @@ export class TileGpuStore {
         const yf = this.currentConfig.y.field;
         if (xf && xf !== 'x_u16' && xf !== 'y_u16' && !slot.buffers.has(xf)) return false;
         if (yf && yf !== 'y_u16' && yf !== 'x_u16' && !slot.buffers.has(yf)) return false;
+        if (this.filterExtraField1 && !slot.buffers.has(this.filterExtraField1)) return false;
+        if (this.filterExtraField2 && !slot.buffers.has(this.filterExtraField2)) return false;
         return true;
     }
 
@@ -532,12 +541,18 @@ export class TileGpuStore {
                     }
                 }
 
+                if (tile.rowMaskSlices && this.onSlotMaskUploaded) {
+                    this.onSlotMaskUploaded(slotIdx, tile.rowMaskSlices);
+                } else if (isNewSlot && this.onSlotMaskUploaded) {
+                    this.onSlotMaskUploaded(slotIdx, []);
+                }
+
                 tile.needsUpdate = false;
                 if (this.onReleaseCpuTileBuffers) {
                     this.onReleaseCpuTileBuffers(tile);
                 }
-                if (this.onSlotDisposed) {
-                    this.onSlotDisposed(slotIdx);
+                if (this.onSlotBindingsInvalidated) {
+                    this.onSlotBindingsInvalidated(slotIdx);
                 }
                 uploadedThisFrame++;
             }

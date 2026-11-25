@@ -10,6 +10,7 @@ import {
 import PQueue from 'p-queue';
 import { decompressSync } from 'fflate';
 import type { BoundingBox, CustomRangeSource, TileSource } from './lib/types.ts';
+import type { WorkerSpatialQuerySpec } from './workerCodec.ts';
 
 const MAX_COL_POOL_PER_COLUMN = 16;
 const MAX_RAW_PAYLOAD_POOL = 16;
@@ -121,6 +122,7 @@ export interface TileData {
     numRows: number;
     needsUpdate?: boolean;
     uploadedToGpu?: boolean;
+    rowMaskSlices?: ArrayBuffer[];
 }
 
 export interface SchemaField {
@@ -180,6 +182,14 @@ export class PMTilesClient {
         string,
         { resolve: Function; reject: Function; onCacheMiss?: () => void }
     >();
+    private workerRpcResolvers = new Map<
+        string,
+        { resolve: (data: any) => void; reject: (err: Error) => void }
+    >();
+    private retainRowIds = false;
+    private hasActiveRowIdFilter = false;
+    private indexedTileKeys = new Set<string>();
+    private tileRowIndexBytes = new Map<string, number>();
     private rawPickTileCache = new Map<string, { slices: (ArrayBuffer | null)[]; byteLength: number }>();
     private rawPickTileCacheBytes = 0;
     private workerCachedRowKey = new Map<Worker, string>();
@@ -419,19 +429,301 @@ export class PMTilesClient {
         return entry.slices;
     }
 
-    private clearRawPickTileCache(notifyWorkers = true): void {
+    private clearRawPickTileCache(notifyWorkers = true, clearRowIds = false): void {
         this.rawPickTileCache.clear();
         this.rawPickTileCacheBytes = 0;
         this.workerCachedRowKey.clear();
+        if (clearRowIds) {
+            this.indexedTileKeys.clear();
+            this.tileRowIndexBytes.clear();
+            this.hasActiveRowIdFilter = false;
+        }
         for (const inflight of this.inFlightPickTileFetches.values()) {
             inflight.controller.abort();
         }
         this.inFlightPickTileFetches.clear();
         if (notifyWorkers) {
             for (const worker of this.allWorkers) {
-                worker.postMessage({ action: 'clear_row_cache' });
+                worker.postMessage({ action: 'clear_row_cache', clearRowIds });
             }
         }
+    }
+
+    private notifyWorkersDropTile(key: string): void {
+        if (!this.indexedTileKeys.has(key) && !this.tileRowIndexBytes.has(key)) return;
+        this.indexedTileKeys.delete(key);
+        this.tileRowIndexBytes.delete(key);
+        for (const worker of this.allWorkers) {
+            worker.postMessage({ action: 'drop_tile', key });
+        }
+    }
+
+    public setRetainRowIds(enabled: boolean): void {
+        if (this.destroyed || this.retainRowIds === enabled) return;
+        this.retainRowIds = enabled;
+        if (!enabled && !this.hasActiveRowIdFilter) {
+            this.indexedTileKeys.clear();
+            this.tileRowIndexBytes.clear();
+        }
+        for (const worker of this.allWorkers) {
+            worker.postMessage({ action: 'set_retain_row_ids', enabled });
+        }
+    }
+
+    private async ensureResidentTilesIndexed(): Promise<void> {
+        if (this.destroyed) return;
+        const missingKeys: string[] = [];
+        for (const key of this.activeTiles.keys()) {
+            if (!this.indexedTileKeys.has(key)) {
+                missingKeys.push(key);
+            }
+        }
+        if (missingKeys.length === 0) return;
+
+        await Promise.all(
+            missingKeys.map(async (key) => {
+                if (this.destroyed || !this.activeTiles.has(key)) return;
+                const [zStr, xStr, yStr] = key.split('/');
+                const z = parseInt(zStr, 10);
+                const x = parseInt(xStr, 10);
+                const y = parseInt(yStr, 10);
+                const rawSlices = await this.fetchOrGetRawPickTile(z, x, y, key);
+                if (!rawSlices || this.destroyed || !this.activeTiles.has(key)) return;
+
+                const transfers: ArrayBuffer[] = [];
+                const copies = rawSlices.map((s) => {
+                    if (!s || s.byteLength === 0) return null;
+                    const c = s.slice(0);
+                    transfers.push(c);
+                    return c;
+                });
+
+                await new Promise<void>((resolve, reject) => {
+                    if (this.destroyed) {
+                        resolve();
+                        return;
+                    }
+                    const id = `idx_${++this.nextReqId}`;
+                    this.workerRpcResolvers.set(id, {
+                        resolve: (res) => {
+                            if (this.activeTiles.has(key)) {
+                                this.indexedTileKeys.add(key);
+                                if (typeof res.rowIndexBytes === 'number' && res.rowIndexBytes > 0) {
+                                    this.tileRowIndexBytes.set(key, res.rowIndexBytes);
+                                }
+                                if (Array.isArray(res.slices) && res.slices.length > 0) {
+                                    const t = this.activeTiles.get(key);
+                                    if (t) t.rowMaskSlices = res.slices;
+                                }
+                            } else {
+                                this.notifyWorkersDropTile(key);
+                            }
+                            resolve();
+                        },
+                        reject,
+                    });
+                    this.dispatchToWorker(
+                        { action: 'index_tile_rowids', id, key, buffers: copies },
+                        transfers
+                    );
+                });
+            })
+        );
+    }
+
+    /**
+     * Compiles `32 KiB` (`262,144`-bit) per-slot visibility masks across all workers off the main thread.
+     * Returns a map of `tileKey -> ArrayBuffer[]` slices for currently resident tiles.
+     */
+    public async setRowIdFilter(
+        ids: Iterable<number | bigint | string> | Uint32Array | BigUint64Array | null,
+        probeRowIds?: BigUint64Array | null
+    ): Promise<{ masks: Map<string, ArrayBuffer[]>; probeMatches: Uint8Array | null }> {
+        const result = new Map<string, ArrayBuffer[]>();
+        if (this.destroyed) return { masks: result, probeMatches: null };
+
+        if (ids === null) {
+            this.hasActiveRowIdFilter = false;
+            for (const tile of this.activeTiles.values()) {
+                delete tile.rowMaskSlices;
+            }
+            await Promise.all(
+                this.allWorkers.map(
+                    (worker) =>
+                        new Promise<void>((resolve, reject) => {
+                            const id = `rowfilt_${++this.nextReqId}`;
+                            this.workerRpcResolvers.set(id, {
+                                resolve: () => resolve(),
+                                reject,
+                            });
+                            worker.postMessage({
+                                action: 'set_rowid_filter',
+                                id,
+                                hasFilter: false,
+                            });
+                        })
+                )
+            );
+            if (!this.retainRowIds) {
+                this.indexedTileKeys.clear();
+                this.tileRowIndexBytes.clear();
+            }
+            return { masks: result, probeMatches: null };
+        }
+
+        // Pack into raw Uint32Array or BigUint64Array WITHOUT main-thread .sort() —
+        // when callers pass Uint32Array / BigUint64Array (Mosaic Arrow IPC / pydeepgraph),
+        // zero main-thread O(N) element loops or sorts occur (`AGENTS.md` §3.3)!
+        let rawU32: Uint32Array | null = null;
+        let rawU64: BigUint64Array | null = null;
+
+        if (ids instanceof Uint32Array) {
+            rawU32 = ids;
+        } else if (ids instanceof BigUint64Array) {
+            rawU64 = ids;
+        } else {
+            let needs64 = false;
+            const tempNum: number[] = [];
+            const tempBig: bigint[] = [];
+            for (const item of ids) {
+                if (typeof item === 'bigint') {
+                    tempBig.push(BigInt.asUintN(64, item));
+                    if (item < 0n || item > 0xffffffffn) needs64 = true;
+                } else if (typeof item === 'string') {
+                    const trimmed = item.trim();
+                    if (!trimmed) continue;
+                    const b = BigInt.asUintN(64, BigInt(trimmed));
+                    tempBig.push(b);
+                    if (b > 0xffffffffn) needs64 = true;
+                } else if (typeof item === 'number' && Number.isFinite(item)) {
+                    if (item >= 0 && item <= 0xffffffff && Number.isInteger(item)) {
+                        tempNum.push(item >>> 0);
+                    } else {
+                        tempBig.push(BigInt.asUintN(64, BigInt(Math.trunc(item))));
+                        needs64 = true;
+                    }
+                }
+            }
+
+            if (!needs64 && tempBig.length === 0) {
+                rawU32 = new Uint32Array(tempNum);
+            } else if (!needs64) {
+                rawU32 = new Uint32Array(tempNum.length + tempBig.length);
+                for (let i = 0; i < tempNum.length; i++) rawU32[i] = tempNum[i];
+                for (let i = 0; i < tempBig.length; i++) {
+                    rawU32[tempNum.length + i] = Number(tempBig[i]);
+                }
+            } else {
+                rawU64 = new BigUint64Array(tempNum.length + tempBig.length);
+                for (let i = 0; i < tempNum.length; i++) rawU64[i] = BigInt(tempNum[i]);
+                for (let i = 0; i < tempBig.length; i++) {
+                    rawU64[tempNum.length + i] = tempBig[i];
+                }
+            }
+        }
+
+        this.hasActiveRowIdFilter = true;
+        this.setRetainRowIds(true);
+        await this.ensureResidentTilesIndexed();
+        if (this.destroyed) return { masks: result, probeMatches: null };
+
+        let probeMatches: Uint8Array | null = null;
+        const workerResponses = await Promise.all(
+            this.allWorkers.map(
+                (worker, workerIdx) =>
+                    new Promise<{ key: string; slices: ArrayBuffer[] }[]>((resolve, reject) => {
+                        const id = `rowfilt_${++this.nextReqId}`;
+                        const u32Copy = rawU32 ? (rawU32.slice().buffer as ArrayBuffer) : null;
+                        const u64Copy = rawU64 ? (rawU64.slice().buffer as ArrayBuffer) : null;
+                        const probeCopy =
+                            workerIdx === 0 && probeRowIds && probeRowIds.length > 0
+                                ? (probeRowIds.slice().buffer as ArrayBuffer)
+                                : null;
+                        const transfers: ArrayBuffer[] = [];
+                        if (u32Copy) transfers.push(u32Copy);
+                        if (u64Copy) transfers.push(u64Copy);
+                        if (probeCopy) transfers.push(probeCopy);
+
+                        this.workerRpcResolvers.set(id, {
+                            resolve: (res) => {
+                                if (workerIdx === 0 && res.probeMaskBuffer instanceof ArrayBuffer) {
+                                    probeMatches = new Uint8Array(res.probeMaskBuffer);
+                                }
+                                resolve(res.masks ?? []);
+                            },
+                            reject,
+                        });
+                        worker.postMessage(
+                            {
+                                action: 'set_rowid_filter',
+                                id,
+                                hasFilter: true,
+                                isSorted: false,
+                                u32Buffer: u32Copy,
+                                u64Buffer: u64Copy,
+                                probeRowIdsBuffer: probeCopy,
+                            },
+                            transfers
+                        );
+                    })
+            )
+        );
+
+        for (const masks of workerResponses) {
+            for (const m of masks) {
+                result.set(m.key, m.slices);
+                const tile = this.activeTiles.get(m.key);
+                if (tile && !tile.uploadedToGpu) {
+                    tile.rowMaskSlices = m.slices;
+                }
+            }
+        }
+        return { masks: result, probeMatches };
+    }
+
+    /** Queries loaded visible tiles in workers for `row_id`s matching a spatial `rect` or `lasso`. */
+    public async queryLoadedSpatialSelection(
+        spec: WorkerSpatialQuerySpec
+    ): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }> {
+        if (this.destroyed) return { rowIds: [], rowIdsBigInt: [] };
+        this.setRetainRowIds(true);
+        await this.ensureResidentTilesIndexed();
+        if (this.destroyed) return { rowIds: [], rowIdsBigInt: [] };
+
+        const visibleKeys = Array.from(this.currentlyVisibleIds);
+        const buffers = await Promise.all(
+            this.allWorkers.map(
+                (worker) =>
+                    new Promise<ArrayBuffer>((resolve, reject) => {
+                        const id = `selq_${++this.nextReqId}`;
+                        this.workerRpcResolvers.set(id, {
+                            resolve: (res) => resolve(res.idsBuffer as ArrayBuffer),
+                            reject,
+                        });
+                        worker.postMessage({
+                            action: 'query_loaded_selection',
+                            id,
+                            visibleKeys,
+                            spec,
+                        });
+                    })
+            )
+        );
+
+        const seen = new Set<bigint>();
+        const rowIds: number[] = [];
+        const rowIdsBigInt: bigint[] = [];
+        for (const buf of buffers) {
+            const arr = new BigUint64Array(buf);
+            for (let i = 0; i < arr.length; i++) {
+                const v = arr[i];
+                if (seen.has(v)) continue;
+                seen.add(v);
+                rowIdsBigInt.push(v);
+                rowIds.push(Number(v));
+            }
+        }
+        return { rowIds, rowIdsBigInt };
     }
 
     public setRootBounds(rootBounds: BoundingBox): void {
@@ -464,9 +756,11 @@ export class PMTilesClient {
      * eliminating duplicate CPU TypedArray retention across cached tiles.
      */
     public releaseTileCpuBuffers(tile: TileData): void {
-        if (!tile.columns) return;
-        this.recycleColumnMap(tile.columns);
-        tile.columns = {};
+        if (tile.columns) {
+            this.recycleColumnMap(tile.columns);
+            tile.columns = {};
+        }
+        delete tile.rowMaskSlices;
         tile.uploadedToGpu = true;
     }
 
@@ -513,6 +807,10 @@ export class PMTilesClient {
             pooledRawPayloadBuffers++;
             pooledRawPayloadBytes += b.byteLength;
         }
+        let workerRowIndexBytes = 0;
+        for (const b of this.tileRowIndexBytes.values()) {
+            workerRowIndexBytes += b;
+        }
         return {
             activeTileCount: this.activeTiles.size,
             uploadedTileCount,
@@ -528,7 +826,8 @@ export class PMTilesClient {
                 retainedTileCpuBytes +
                 pooledColumnBytes +
                 pooledRawPayloadBytes +
-                this.rawPickTileCacheBytes,
+                this.rawPickTileCacheBytes +
+                workerRowIndexBytes,
         };
     }
 
@@ -616,7 +915,8 @@ export class PMTilesClient {
             }
         }
 
-        for (const tile of this.activeTiles.values()) {
+        for (const [key, tile] of this.activeTiles.entries()) {
+            this.notifyWorkersDropTile(key);
             this.recycleColumnMap(tile.columns);
             tile.columns = {};
         }
@@ -633,7 +933,7 @@ export class PMTilesClient {
             abort.abort();
         }
         this.abortControllers.clear();
-        this.clearRawPickTileCache(true);
+        this.clearRawPickTileCache(true, false);
     }
 
     public async getSchema(): Promise<SchemaField[]> {
@@ -917,6 +1217,12 @@ export class PMTilesClient {
             rowReq.reject(new Error('PMTilesClient destroyed'));
         }
         this.rowDecodeResolvers.clear();
+        for (const [, rpcReq] of this.workerRpcResolvers) {
+            rpcReq.reject(new Error('PMTilesClient destroyed'));
+        }
+        this.workerRpcResolvers.clear();
+        this.indexedTileKeys.clear();
+        this.tileRowIndexBytes.clear();
         for (const worker of this.allWorkers) {
             worker.terminate();
         }
@@ -934,6 +1240,23 @@ export class PMTilesClient {
     private handleWorkerMessage(e: MessageEvent, worker: Worker) {
         if (this.destroyed) return;
         const data = e.data;
+        if (
+            data.action === 'set_rowid_filter' ||
+            data.action === 'query_loaded_selection' ||
+            data.action === 'index_tile_rowids'
+        ) {
+            const resolver = this.workerRpcResolvers.get(data.id);
+            if (resolver) {
+                this.workerRpcResolvers.delete(data.id);
+                if (data.error) resolver.reject(new Error(data.error));
+                else resolver.resolve(data);
+            }
+            if (data.action === 'index_tile_rowids') {
+                this.checkPendingTasks(worker);
+            }
+            return;
+        }
+
         if (data.action === 'decompress') {
             const resolver = this.decompressResolvers.get(data.id);
             if (resolver) {
@@ -1016,12 +1339,19 @@ export class PMTilesClient {
                 if (data.dictionaries && this.onDictionariesLoaded) {
                     this.onDictionariesLoaded(data.dictionaries);
                 }
+                if (typeof data.rowIndexBytes === 'number' && data.rowIndexBytes > 0) {
+                    this.indexedTileKeys.add(data.key);
+                    this.tileRowIndexBytes.set(data.key, data.rowIndexBytes);
+                }
                 const tileData: TileData = {
                     key: data.key,
                     columns: data.columns,
                     numRows,
                     needsUpdate: true,
                     uploadedToGpu: false,
+                    ...(Array.isArray(data.rowMaskSlices) && data.rowMaskSlices.length > 0
+                        ? { rowMaskSlices: data.rowMaskSlices }
+                        : {}),
                 };
                 req.resolve(tileData);
 
@@ -1080,6 +1410,9 @@ export class PMTilesClient {
             }
         } else {
             // Request was aborted before worker responded — recycle within tight cap
+            if (typeof data.key === 'string') {
+                this.notifyWorkersDropTile(data.key);
+            }
             this.recycleColumnMap(data.columns);
             if (data.rawPayloads) {
                 for (const rawBuf of data.rawPayloads) {
@@ -1203,6 +1536,7 @@ export class PMTilesClient {
         // before it was ever uploaded to a GPU slot (`0 B` duplicate/orphaned CPU column retention).
         for (const [key, tile] of Array.from(this.activeTiles.entries())) {
             if (!this.currentlyVisibleIds.has(key) && !tile.uploadedToGpu) {
+                this.notifyWorkersDropTile(key);
                 this.recycleColumnMap(tile.columns);
                 tile.columns = {};
                 this.activeTiles.delete(key);
@@ -1237,6 +1571,7 @@ export class PMTilesClient {
                     this.recycleColumnMap(evictedTile.columns);
                     evictedTile.columns = {};
                 }
+                this.notifyWorkersDropTile(oldestKey);
                 this.activeTiles.delete(oldestKey);
                 this.lastSeenTimestamp.delete(oldestKey);
                 if (this.onTileUnloaded) this.onTileUnloaded(oldestKey);
@@ -1355,6 +1690,7 @@ export class PMTilesClient {
                 requestedColumns: this.requestedColumns,
                 pooledColumns,
                 colOrigins: this.colOrigins,
+                retainRowIds: this.retainRowIds || this.hasActiveRowIdFilter,
             };
             this.dispatchToWorker(payload, transferables, signal);
         });

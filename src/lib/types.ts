@@ -51,6 +51,91 @@ export type AggregationStrategy = 'points' | 'mean_field';
 /** Rendering shader pipeline: standard Cartesian plot or calibrated optical flux. */
 export type RenderPipelineMode = 'cartesian' | 'optical';
 
+/** Active pointer drag behavior on the canvas (`'pan'` default; `Shift+drag` triggers `shiftDragMode`). */
+export type InteractionMode = 'pan' | 'brush' | 'lasso';
+
+/** 2D axis-aligned rectangle brush in active **data coordinates** (`xField`/`yField` or spatial `dataBounds`). */
+export interface RectBrushClause {
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+}
+
+/** Closed 2D polygon lasso (`>= 3` vertices) in active **data coordinates**. */
+export interface LassoPolygonClause {
+    /** Data-space `[x, y]` vertices; simplified via Ramer-Douglas-Peucker to `<= 64` GPU vertices. */
+    points: ReadonlyArray<readonly [number, number]>;
+}
+
+/** Zero-SQL GPU Fast-Path filter evaluated directly in `ComputeRasterizer` & `PickingLayer`. */
+export interface DeepgraphFilter {
+    /** 2D rectangle brush in current active X/Y data coordinates. */
+    rect?: RectBrushClause | null;
+    /** 2D freehand polygon lasso in current active X/Y data coordinates. */
+    lasso?: LassoPolygonClause | null;
+    /** Numeric `[min, max]` intervals keyed by GPU-resident column (`color`, `size`, `x`, `y`, plus up to 2 spatial extra columns). */
+    ranges?: Record<string, readonly [number, number]>;
+    /** Allowed category labels or integer codes keyed by categorical column (`<= 512` codes on GPU fast path). */
+    categories?: Record<string, ReadonlyArray<string | number>>;
+    /**
+     * Opacity multiplier for unselected context points in Optical (`Mode 0`) and Point (`Mode 1`) pipelines
+     * (`0.0` default = hard cull; e.g. `0.08` renders dimmed background context via a 2-pass resolve while `PickingLayer` skips unselected points).
+     * Mean-field (`Mode 2`) and flow modes (`Modes 3/4`) always hard-cull unselected rows so averages remain unbiased.
+     */
+    unselectedOpacity?: number;
+}
+
+/** Geometric selection predicate emitted on `'brush'` (live drag) and `'select'` (committed `pointerup` / `click` / `clearSelection`). */
+export interface SelectionGeometryClause {
+    kind: 'point' | 'rect' | 'lasso' | 'none';
+    xField: string | null;
+    yField: string | null;
+    rect?: RectBrushClause;
+    lasso?: LassoPolygonClause;
+}
+
+/** Curved quadratic Bézier graph/kNN arc specification (`EdgeOverlay`). */
+export interface EdgeSpec {
+    sourceRowId?: number | bigint;
+    targetRowId?: number | bigint;
+    /** Data-space source/target coordinates (renders edges even when endpoints reside in unloaded deep tiles). */
+    source?: { x: number; y: number };
+    target?: { x: number; y: number };
+    /** Optional per-column values so edges interpolate smoothly across 2-second chart axis transitions. */
+    sourceAttributes?: Record<string, unknown>;
+    targetAttributes?: Record<string, unknown>;
+    weight?: number;
+    /** Optional per-edge curvature override (`EdgeStyleOptions.curvature` default). */
+    curvature?: number;
+    colorHex?: number;
+    directed?: boolean;
+}
+
+/** Visual styling options for curved quadratic Bézier graph arcs (`EdgeOverlay`). */
+export interface EdgeStyleOptions {
+    /** Base stroke width in CSS pixels (`1.35` default) or `[minPx, maxPx]` mapped across `weightDomain`. */
+    width?: number | [number, number];
+    weightDomain?: [number, number];
+    /** Signed normal bow ratio relative to chord length (`0.18` default; `0` = straight segments). */
+    curvature?: number;
+    /** Base edge opacity (`0.68` default). */
+    opacity?: number;
+    /** Default `0xRRGGBB` edge tint when `EdgeSpec.colorHex` is omitted (`0x7dd3fc` cyan-sky default). */
+    colorHex?: number;
+    /** Taper alpha & brightness from source -> target (`true` default). */
+    directed?: boolean;
+    /** Optional subtle animated pulse along directed arcs (`false` default — stationary frames remain `0.0000%` shimmer!). */
+    animatePulse?: boolean;
+}
+
+/** Async or synchronous 1-hop ego-network / kNN edge resolver invoked on point hover or click. */
+export type EgoEdgeResolver = (
+    hit: PointHitEvent,
+    trigger: 'hover' | 'click',
+    signal: AbortSignal
+) => Promise<EdgeSpec[]> | EdgeSpec[];
+
 /** Experimental / domain-specific astronomy & flow modes configured via `preset.experimental` or `setViewOptions({ experimental })`. */
 export interface ExperimentalOptions {
     colorScale?: ExperimentalColorScaleName;
@@ -280,6 +365,11 @@ export interface PointHitEvent {
 
 export interface PointSelectEvent {
     points: PointHitEvent[];
+    /** Geometric predicate over active X/Y data coordinates for querying all `N` rows in DuckDB/Mosaic/Marimo. */
+    clause?: SelectionGeometryClause;
+    /** Loaded-tile `row_id`s matching a committed brush/lasso when `enableRowIdIndex` is active. */
+    rowIds?: number[];
+    rowIdsBigInt?: bigint[];
 }
 
 /** Optional sidecar hook (`D8(2)`) to enrich picked `rowId`s with cold/dropped columns (e.g. from Parquet). */
@@ -303,6 +393,22 @@ export interface DeepgraphOptions {
     maxTileCache?: number;
     /** Optional WebGPU adapter power preference (`'high-performance'` default, or `'low-power'` to prefer integrated GPUs). */
     powerPreference?: 'high-performance' | 'low-power';
+    /** Initial pointer drag mode (`'pan'` default). */
+    interactionMode?: InteractionMode;
+    /** Drag mode triggered when holding `Shift` while in `'pan'` mode (`'brush'` default). */
+    shiftDragMode?: 'brush' | 'lasso' | 'none';
+    /** Retain compact per-tile `row_id` arrays in workers for `setFilteredRowIds` / `getSelectedRowIds` (`false` default; auto-enabled on demand). */
+    enableRowIdIndex?: boolean;
+    /** Initial declarative GPU cross-filter. */
+    filter?: DeepgraphFilter;
+    /** Initial static curved graph/kNN edges (`EdgeOverlay`). */
+    edges?: EdgeSpec[];
+    /** Initial visual styling for `EdgeOverlay` arcs. */
+    edgeStyle?: EdgeStyleOptions;
+    /** Optional async/sync resolver for 1-hop ego-network / kNN arcs on hover or click. */
+    resolveEdges?: EgoEdgeResolver;
+    /** Whether `resolveEdges` runs on `'hover'` as well as `'click'` (`true` default when `resolveEdges` is set). */
+    resolveEdgesOnHover?: boolean;
     /** Optional async resolver for dropped/sidecar columns on point inspect (`D8(2)`). */
     resolveRowAttributes?: RowAttributeResolver;
     /**
@@ -329,6 +435,7 @@ export interface DeepgraphEventMap {
     click: PointHitEvent | null;
     hover: PointHitEvent | null;
     select: PointSelectEvent;
+    brush: SelectionGeometryClause;
     telemetry: TelemetrySnapshot;
     load: DatasetMetadataSummary;
     error: Error;
@@ -351,6 +458,28 @@ export interface DeepgraphPlot {
     fitView(): void;
     /** Programmatically picks the highest-priority rendered point within a `9x9 CSS px` window around `(cssX, cssY)`. */
     pickAt(cssX: number, cssY: number): Promise<PointHitEvent | null>;
+    /** Sets the active left-drag pointer mode (`'pan'`, `'brush'`, or `'lasso'`). */
+    setInteractionMode(mode: InteractionMode): void;
+    /** Returns the active left-drag pointer mode. */
+    getInteractionMode(): InteractionMode;
+    /** Applies or clears a zero-SQL GPU cross-filter (`rect`, `lasso`, `ranges`, `categories`, `unselectedOpacity`). */
+    setFilter(filter: DeepgraphFilter | null): void;
+    /** Returns a snapshot of the active declarative `DeepgraphFilter`, or `null` when unfiltered. */
+    getFilter(): DeepgraphFilter | null;
+    /** Returns `true` when `filter` can execute 100% on the GPU uniform fast path (`<= 6` GPU-resident range slots, `<= 2` categorical columns with `< 512` codes). */
+    canApplyFilterOnGpu(filter: DeepgraphFilter | null): boolean;
+    /** Filters visible points by exact `row_id` membership compiled off-main-thread into `@binding(11)` `32 KiB` slot bitmasks (`null` clears). */
+    setFilteredRowIds(
+        ids: Iterable<number | bigint | string> | Uint32Array | BigUint64Array | null
+    ): Promise<void>;
+    /** Clears any active interactive brush/lasso, selected point rings, and ego-graph arcs. */
+    clearSelection(): void;
+    /** Queries loaded tiles in workers for `row_id`s matching the active selection/filter. */
+    getSelectedRowIds(): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }>;
+    /** Replaces the static curved graph/kNN edge layer (`<= 100,000` instanced quadratic Bézier arcs). */
+    setEdges(edges: ReadonlyArray<EdgeSpec>, style?: EdgeStyleOptions): void;
+    /** Updates visual styling for static and ego-resolved graph arcs. */
+    setEdgeStyle(style: EdgeStyleOptions): void;
     on<K extends keyof DeepgraphEventMap>(
         event: K,
         handler: (payload: DeepgraphEventMap[K]) => void

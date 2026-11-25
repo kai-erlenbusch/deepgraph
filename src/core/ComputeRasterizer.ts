@@ -1,3 +1,11 @@
+import {
+    buildSharedFilterWGSL,
+    FilterGpuResources,
+    GLOBAL_FILTER_UNIFORM_BYTES,
+    SLOT_MASK_ROWS_PER_SLICE,
+    SLOT_MASK_SLICE_BYTES,
+    type AxisProjectionContext,
+} from './FilterGpuResources.ts';
 import type { Camera2D, Renderer } from './Renderer.ts';
 import type { AnyColorScaleName, InternalAxisConfig, TileGpuStore } from './TileGpuStore.ts';
 
@@ -11,6 +19,7 @@ function smoothstepCpu(edge0: number, edge1: number, x: number): number {
 
 interface CachedSlotBindGroup {
     bindGroup: GPUBindGroup;
+    uniformBuf: GPUBuffer;
     xyBuf: GPUBuffer;
     colorBuf: GPUBuffer;
     sizeBuf: GPUBuffer;
@@ -18,6 +27,8 @@ interface CachedSlotBindGroup {
     yBuf: GPUBuffer;
     auxOrPrevXBuf: GPUBuffer;
     prevYBuf: GPUBuffer;
+    globalFilterBuf: GPUBuffer;
+    maskBuf: GPUBuffer;
 }
 
 /**
@@ -44,9 +55,17 @@ export class ComputeRasterizer {
     private canvasFormat!: GPUTextureFormat;
 
     private computePipeline!: GPUComputePipeline;
+    private computeUnselectedPipeline!: GPUComputePipeline;
+    private computeSelectedPipeline!: GPUComputePipeline;
     private computeBindGroupLayout!: GPUBindGroupLayout;
     private resolvePipeline!: GPURenderPipeline;
+    private resolveDimBgPipeline!: GPURenderPipeline;
+    private resolveFgOverlayPipeline!: GPURenderPipeline;
     private resolveBindGroupLayout!: GPUBindGroupLayout;
+
+    private filterResources: FilterGpuResources | null = null;
+    private ownsFilterResources = false;
+    private allocatedUniformSlots: number;
 
     private uniformBuffer: GPUBuffer | null = null;
     private uniformArrayBuffer: ArrayBuffer;
@@ -65,10 +84,16 @@ export class ComputeRasterizer {
     private initialized = false;
     private disposed = false;
 
-    constructor(rendererWrapper: Renderer, maxSlots = 264) {
+    constructor(
+        rendererWrapper: Renderer,
+        maxSlots = 264,
+        filterResources?: FilterGpuResources
+    ) {
         this.rendererWrapper = rendererWrapper;
         this.maxSlots = Math.max(64, maxSlots);
-        this.uniformArrayBuffer = new ArrayBuffer(this.maxSlots * SLOT_UNIFORM_STRIDE);
+        this.allocatedUniformSlots = this.maxSlots;
+        this.filterResources = filterResources ?? null;
+        this.uniformArrayBuffer = new ArrayBuffer(this.allocatedUniformSlots * SLOT_UNIFORM_STRIDE);
         this.uniformF32 = new Float32Array(this.uniformArrayBuffer);
         this.uniformU32 = new Uint32Array(this.uniformArrayBuffer);
         this.slotBindGroups = new Array(this.maxSlots).fill(null);
@@ -94,9 +119,15 @@ export class ComputeRasterizer {
         this.context = context;
         this.canvasFormat = this.rendererWrapper.canvasFormat;
 
+        if (!this.filterResources) {
+            this.filterResources = new FilterGpuResources(device, this.maxSlots);
+            this.ownsFilterResources = true;
+        }
+        this.filterResources.init();
+
         this.uniformBuffer = this.device.createBuffer({
             label: 'ComputeRasterizer_SlotUniforms',
-            size: this.maxSlots * SLOT_UNIFORM_STRIDE,
+            size: this.allocatedUniformSlots * SLOT_UNIFORM_STRIDE,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
@@ -120,7 +151,13 @@ export class ComputeRasterizer {
     }
 
     private ensureScreenBuffers(): void {
-        if (!this.uniformBuffer) return;
+        if (
+            !this.uniformBuffer ||
+            !this.filterResources ||
+            !this.filterResources.globalFilterBuffer
+        ) {
+            return;
+        }
         const canvas = this.rendererWrapper.canvas;
         const w = Math.max(1, canvas.width);
         const h = Math.max(1, canvas.height);
@@ -143,7 +180,8 @@ export class ComputeRasterizer {
             this.device.limits?.maxBufferSize ?? 268_435_456
         );
         const requestedBytes = this.width * this.height * 8;
-        const safeBytes = Math.max(16, Math.min(maxBind & ~7, requestedBytes));
+        const alignedMaxBind = Math.floor(Number(maxBind) / 8) * 8;
+        const safeBytes = Math.max(16, Math.min(alignedMaxBind, requestedBytes));
         this.maxAccumPixels = Math.floor(safeBytes / 8);
 
         this.accumBuffer = this.device.createBuffer({
@@ -173,8 +211,51 @@ export class ComputeRasterizer {
                         buffer: this.accumBuffer,
                     },
                 },
+                {
+                    binding: 2,
+                    resource: {
+                        buffer: this.filterResources.globalFilterBuffer,
+                    },
+                },
             ],
         });
+    }
+
+    private ensureUniformSlotCapacity(requiredSlots: number): void {
+        if (!this.device || requiredSlots <= this.allocatedUniformSlots) return;
+        const nextSlots = Math.max(requiredSlots, Math.ceil(this.allocatedUniformSlots * 1.5));
+        this.allocatedUniformSlots = nextSlots;
+        this.uniformArrayBuffer = new ArrayBuffer(nextSlots * SLOT_UNIFORM_STRIDE);
+        this.uniformF32 = new Float32Array(this.uniformArrayBuffer);
+        this.uniformU32 = new Uint32Array(this.uniformArrayBuffer);
+        if (this.uniformBuffer) {
+            this.uniformBuffer.destroy();
+        }
+        this.uniformBuffer = this.device.createBuffer({
+            label: 'ComputeRasterizer_SlotUniforms',
+            size: nextSlots * SLOT_UNIFORM_STRIDE,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        for (let i = 0; i < this.slotBindGroups.length; i++) {
+            this.slotBindGroups[i] = null;
+        }
+        if (this.accumBuffer && this.filterResources?.globalFilterBuffer) {
+            this.resolveBindGroup = this.device.createBindGroup({
+                layout: this.resolveBindGroupLayout,
+                entries: [
+                    {
+                        binding: 0,
+                        resource: {
+                            buffer: this.uniformBuffer,
+                            offset: 0,
+                            size: UNIFORM_BINDING_SIZE,
+                        },
+                    },
+                    { binding: 1, resource: { buffer: this.accumBuffer } },
+                    { binding: 2, resource: { buffer: this.filterResources.globalFilterBuffer } },
+                ],
+            });
+        }
     }
 
     private createPipelines(): void {
@@ -257,7 +338,7 @@ struct SlotUniforms {
     resolvedPointOpacity: f32,
     resolvedExposure: f32,
     mode1RefCount: f32,
-    _pad63: f32,
+    rowBaseOffset: u32,
 };
 `;
 
@@ -394,6 +475,7 @@ struct PaletteUniforms {
 @group(0) @binding(7) var<storage, read_write> accumBuf: array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read> auxBuf: array<f32>;
 @group(0) @binding(9) var<storage, read> prevYBuf: array<f32>;
+${buildSharedFilterWGSL(10, 11)}
 
 fn pcg_hash(v_in: u32) -> f32 {
     let state = v_in * 747796405u + 2891336453u;
@@ -742,15 +824,15 @@ fn splat_motion3d_streamline(px: i32, py: i32) {
     atomicAdd(&accumBuf[base2 + 1u], 1u << 24u);
 }
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn splat_point_impl(gid: vec3<u32>, passKind: u32) {
     if (gid.x >= u.numPoints) {
         return;
     }
-    // 2048-element bijective Hilbert warp de-correlation
+    // 2048-element bijective Hilbert warp de-correlation (chunk-local for 262,144-row slices)
     let blockEnd = (gid.x & ~2047u) + 2048u;
     let scrambled = gid.x ^ ((gid.x & 31u) << 6u);
-    let i = select(gid.x, scrambled, blockEnd <= u.numPoints);
+    let localI = select(gid.x, scrambled, blockEnd <= u.numPoints);
+    let i = u.rowBaseOffset + localI;
 
     let isXSpatial = (u.flags & 1u) != 0u;
     let isYSpatial = (u.flags & 2u) != 0u;
@@ -852,6 +934,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             u.rtcStepY,
             isYLiteral
         );
+    }
+
+    // 3b. Zero-SQL GPU Cross-Filter & 2D Brush/Lasso/Bitmask evaluation (in target axis space BEFORE 2s mix)
+    if (filterU.header.x != 0u) {
+        var filtCVal = 0.0;
+        if (hasColorBuf) { filtCVal = colorBuf[i]; }
+        var filtSVal = 0.0;
+        if (hasSizeBuf) { filtSVal = sizeBuf[i]; }
+        var filtXVal = 0.0;
+        if (hasXBuf) { filtXVal = xBuf[i]; }
+        var filtYVal = 0.0;
+        if (hasYBuf) { filtYVal = yBuf[i]; }
+        let isSelected = eval_filter_selected(
+            localI,
+            relWorldX,
+            fromTopY,
+            globalX,
+            globalY,
+            filtCVal, hasColorBuf,
+            filtSVal, hasSizeBuf,
+            filtXVal, hasXBuf,
+            filtYVal, hasYBuf
+        );
+        if (passKind == 1u) {
+            if (isSelected) {
+                return;
+            }
+        } else {
+            if (!isSelected) {
+                return;
+            }
+        }
+    } else if (passKind == 1u) {
+        return;
     }
 
     // Smooth 2-second WGSL axis transition (D9)
@@ -1416,13 +1532,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 }
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    splat_point_impl(gid, 0u);
+}
+
+@compute @workgroup_size(256)
+fn main_unselected(@builtin(global_invocation_id) gid: vec3<u32>) {
+    splat_point_impl(gid, 1u);
+}
+
+@compute @workgroup_size(256)
+fn main_selected(@builtin(global_invocation_id) gid: vec3<u32>) {
+    splat_point_impl(gid, 2u);
+}
 `;
 
         const resolveShaderCode = /* wgsl */ `
 ${sharedUniformStructWGSL}
 
+struct ResolveFilterUniforms {
+    header: vec4<u32>,
+    rectRelBounds: vec4<f32>,
+    lassoRelAabb: vec4<f32>,
+    styleParams: vec4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> u: SlotUniforms;
 @group(0) @binding(1) var<storage, read> accumBuf: array<u32>;
+@group(0) @binding(2) var<uniform> filterStyle: ResolveFilterUniforms;
 
 ${sharedColormapWGSL}
 
@@ -1612,9 +1751,156 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
     return vec4<f32>(clamp(bg + rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
+
+// Pass 1 of 2-pass context dim (unselectedOpacity > 0 in Mode 0 / Mode 1):
+// Resolves unselected background points desaturated at unselectedOpacity over opaque bg.
+@fragment
+fn fs_dim_bg(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+    let px = min(u32(fragCoord.x), u.screenWidth - 1u);
+    let py = min(u32(fragCoord.y), u.screenHeight - 1u);
+    let idx = py * u.screenWidth + px;
+    let isLightBg = (u.extraFlags & 1u) != 0u;
+    let bg = select(vec3<f32>(17.0 / 255.0), vec3<f32>(0.975, 0.978, 0.985), isLightBg);
+    let dimOp = clamp(filterStyle.styleParams.x, 0.0, 1.0);
+
+    if (idx >= u.maxAccumPixels || dimOp <= 0.0) {
+        return vec4<f32>(bg, 1.0);
+    }
+    let base2 = idx * 2u;
+    let w0 = accumBuf[base2];
+    let w1 = accumBuf[base2 + 1u];
+    if (w0 == 0u && w1 == 0u) {
+        return vec4<f32>(bg, 1.0);
+    }
+
+    if (u.mode == 1u) {
+        let isCat = (u.flags & 4u) != 0u;
+        var meanRgb = vec3<f32>(0.0);
+        var count = 0.0;
+        if (isCat) {
+            let wRgbSum = w0 >> 16u;
+            if (wRgbSum == 0u) {
+                return vec4<f32>(bg, 1.0);
+            }
+            let rSum = f32(w0 & 0xFFFFu);
+            let gSum = f32(w1 & 0xFFFFu);
+            let bSum = f32(w1 >> 16u);
+            meanRgb = clamp(
+                vec3<f32>(rSum, gSum, bSum) / max(1.0, f32(wRgbSum) * 12.0),
+                vec3<f32>(0.0),
+                vec3<f32>(1.0)
+            );
+            count = f32(wRgbSum) * 0.5;
+        } else {
+            if (w0 == 0u) {
+                return vec4<f32>(bg, 1.0);
+            }
+            let valW = min(w0, 1048576u);
+            let meanT = clamp(f32(w1) / max(1.0, f32(valW) * 1023.0), 0.0, 1.0);
+            meanRgb = eval_ramp(meanT, (u.flags >> 8u) & 15u);
+            count = f32(w0) * 0.25;
+        }
+        let luma = dot(meanRgb, vec3<f32>(0.299, 0.587, 0.114));
+        let mutedRgb = mix(vec3<f32>(luma), meanRgb, 0.35);
+        let refCount = max(1.05, u.mode1RefCount);
+        let logT = clamp(log2(1.0 + count) / log2(1.0 + refCount), 0.0, 1.0);
+        let opScale = select(1.0, clamp(u.resolvedPointOpacity * 2.5, 0.05, 2.5), u.resolvedPointOpacity >= 0.0);
+        let expScale = max(0.05, u.resolvedExposure);
+        if (isLightBg) {
+            let covL = clamp(count * 1.15 * opScale, 0.0, 1.0) * mix(0.45, 0.96, logT) * dimOp;
+            let inkCol = clamp(mutedRgb * mix(0.95, 0.72, logT) * expScale, vec3<f32>(0.0), vec3<f32>(1.0));
+            return vec4<f32>(mix(bg, inkCol, covL), 1.0);
+        }
+        let cov = clamp(count * 1.25 * opScale, 0.0, 1.0) * dimOp;
+        let litCol = clamp(mutedRgb * mix(0.44, 1.06, logT) * expScale, vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec4<f32>(mix(bg, litCol, cov), 1.0);
+    }
+
+    let r = f32(min(w0 & 0xFFFFu, 1024u)) / 1024.0;
+    let g = f32(min(w0 >> 16u, 1024u)) / 1024.0;
+    let b = f32(min(w1 & 0xFFFFu, 1024u)) / 1024.0;
+    let rgb = vec3<f32>(r, g, b);
+    let luma = dot(rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let mutedOpt = mix(vec3<f32>(luma), rgb, 0.35);
+    if (isLightBg) {
+        let lum = clamp(max(r, max(g, b)), 0.0, 1.0) * dimOp;
+        return vec4<f32>(mix(bg, clamp(mutedOpt, vec3<f32>(0.0), vec3<f32>(1.0)), lum), 1.0);
+    }
+    return vec4<f32>(clamp(bg + mutedOpt * dimOp, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+// Pass 2 of 2-pass context dim: Premultiplied-alpha foreground resolve (one / one-minus-src-alpha).
+// Outputs vec4(0.0) on empty pixels so Pass 1's dimmed context cloud is preserved with zero halos.
+@fragment
+fn fs_fg_overlay(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+    let px = min(u32(fragCoord.x), u.screenWidth - 1u);
+    let py = min(u32(fragCoord.y), u.screenHeight - 1u);
+    let idx = py * u.screenWidth + px;
+    if (idx >= u.maxAccumPixels) {
+        return vec4<f32>(0.0);
+    }
+    let base2 = idx * 2u;
+    let w0 = accumBuf[base2];
+    let w1 = accumBuf[base2 + 1u];
+    if (w0 == 0u && w1 == 0u) {
+        return vec4<f32>(0.0);
+    }
+    let isLightBg = (u.extraFlags & 1u) != 0u;
+
+    if (u.mode == 1u) {
+        let isCat = (u.flags & 4u) != 0u;
+        var meanRgb = vec3<f32>(0.0);
+        var count = 0.0;
+        if (isCat) {
+            let wRgbSum = w0 >> 16u;
+            if (wRgbSum == 0u) {
+                return vec4<f32>(0.0);
+            }
+            let rSum = f32(w0 & 0xFFFFu);
+            let gSum = f32(w1 & 0xFFFFu);
+            let bSum = f32(w1 >> 16u);
+            meanRgb = clamp(
+                vec3<f32>(rSum, gSum, bSum) / max(1.0, f32(wRgbSum) * 12.0),
+                vec3<f32>(0.0),
+                vec3<f32>(1.0)
+            );
+            count = f32(wRgbSum) * 0.5;
+        } else {
+            if (w0 == 0u) {
+                return vec4<f32>(0.0);
+            }
+            let valW = min(w0, 1048576u);
+            let meanT = clamp(f32(w1) / max(1.0, f32(valW) * 1023.0), 0.0, 1.0);
+            meanRgb = eval_ramp(meanT, (u.flags >> 8u) & 15u);
+            count = f32(w0) * 0.25;
+        }
+        let refCount = max(1.05, u.mode1RefCount);
+        let logT = clamp(log2(1.0 + count) / log2(1.0 + refCount), 0.0, 1.0);
+        let opScale = select(1.0, clamp(u.resolvedPointOpacity * 2.5, 0.05, 2.5), u.resolvedPointOpacity >= 0.0);
+        let expScale = max(0.05, u.resolvedExposure);
+        if (isLightBg) {
+            let covL = clamp(count * 1.15 * opScale, 0.0, 1.0) * mix(0.45, 0.96, logT);
+            let inkCol = clamp(meanRgb * mix(0.95, 0.72, logT) * expScale, vec3<f32>(0.0), vec3<f32>(1.0));
+            return vec4<f32>(inkCol * covL, covL);
+        }
+        let cov = clamp(count * 1.25 * opScale, 0.0, 1.0);
+        let litCol = clamp(meanRgb * mix(0.44, 1.06, logT) * expScale, vec3<f32>(0.0), vec3<f32>(1.0));
+        return vec4<f32>(litCol * cov, cov);
+    }
+
+    let r = f32(min(w0 & 0xFFFFu, 1024u)) / 1024.0;
+    let g = f32(min(w0 >> 16u, 1024u)) / 1024.0;
+    let b = f32(min(w1 & 0xFFFFu, 1024u)) / 1024.0;
+    let clampedRgb = clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+    if (isLightBg) {
+        let lum = clamp(max(r, max(g, b)), 0.0, 1.0);
+        return vec4<f32>(clampedRgb * lum, lum);
+    }
+    return vec4<f32>(clampedRgb, 0.0);
+}
 `;
 
-        // Exactly 2 uniform buffers (0, 6) and 8 storage buffers (1, 2, 3, 4, 5, 7, 8, 9) <= universal WebGPU baseline!
+        // 4 uniform buffers (0, 6, 10, 11; 2 dynamic) and 8 storage buffers (1..5, 7..9) <= universal WebGPU baseline!
         this.computeBindGroupLayout = this.device.createBindGroupLayout({
             label: 'ComputeRasterizer_ComputeBGL',
             entries: [
@@ -1632,6 +1918,16 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
                 { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
                 { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
                 { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+                {
+                    binding: 10,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'uniform', minBindingSize: GLOBAL_FILTER_UNIFORM_BYTES },
+                },
+                {
+                    binding: 11,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: SLOT_MASK_SLICE_BYTES },
+                },
             ],
         });
 
@@ -1640,15 +1936,24 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             code: computeShaderCode,
         });
 
+        const computeLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [this.computeBindGroupLayout],
+        });
+
         this.computePipeline = this.device.createComputePipeline({
             label: 'ComputeRasterizer_ComputePipeline',
-            layout: this.device.createPipelineLayout({
-                bindGroupLayouts: [this.computeBindGroupLayout],
-            }),
-            compute: {
-                module: computeModule,
-                entryPoint: 'main',
-            },
+            layout: computeLayout,
+            compute: { module: computeModule, entryPoint: 'main' },
+        });
+        this.computeUnselectedPipeline = this.device.createComputePipeline({
+            label: 'ComputeRasterizer_ComputeUnselectedPipeline',
+            layout: computeLayout,
+            compute: { module: computeModule, entryPoint: 'main_unselected' },
+        });
+        this.computeSelectedPipeline = this.device.createComputePipeline({
+            label: 'ComputeRasterizer_ComputeSelectedPipeline',
+            layout: computeLayout,
+            compute: { module: computeModule, entryPoint: 'main_selected' },
         });
 
         this.resolveBindGroupLayout = this.device.createBindGroupLayout({
@@ -1660,6 +1965,11 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
                     buffer: { type: 'uniform', minBindingSize: UNIFORM_BINDING_SIZE },
                 },
                 { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+                {
+                    binding: 2,
+                    visibility: GPUShaderStage.FRAGMENT,
+                    buffer: { type: 'uniform', minBindingSize: GLOBAL_FILTER_UNIFORM_BYTES },
+                },
             ],
         });
 
@@ -1668,23 +1978,60 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             code: resolveShaderCode,
         });
 
+        const resolveLayout = this.device.createPipelineLayout({
+            bindGroupLayouts: [this.resolveBindGroupLayout],
+        });
+
         this.resolvePipeline = this.device.createRenderPipeline({
             label: 'ComputeRasterizer_ResolvePipeline',
-            layout: this.device.createPipelineLayout({
-                bindGroupLayouts: [this.resolveBindGroupLayout],
-            }),
-            vertex: {
-                module: resolveModule,
-                entryPoint: 'vs_main',
-            },
+            layout: resolveLayout,
+            vertex: { module: resolveModule, entryPoint: 'vs_main' },
             fragment: {
                 module: resolveModule,
                 entryPoint: 'fs_main',
                 targets: [{ format: this.canvasFormat }],
             },
-            primitive: {
-                topology: 'triangle-list',
+            primitive: { topology: 'triangle-list' },
+        });
+
+        this.resolveDimBgPipeline = this.device.createRenderPipeline({
+            label: 'ComputeRasterizer_ResolveDimBgPipeline',
+            layout: resolveLayout,
+            vertex: { module: resolveModule, entryPoint: 'vs_main' },
+            fragment: {
+                module: resolveModule,
+                entryPoint: 'fs_dim_bg',
+                targets: [{ format: this.canvasFormat }],
             },
+            primitive: { topology: 'triangle-list' },
+        });
+
+        this.resolveFgOverlayPipeline = this.device.createRenderPipeline({
+            label: 'ComputeRasterizer_ResolveFgOverlayPipeline',
+            layout: resolveLayout,
+            vertex: { module: resolveModule, entryPoint: 'vs_main' },
+            fragment: {
+                module: resolveModule,
+                entryPoint: 'fs_fg_overlay',
+                targets: [
+                    {
+                        format: this.canvasFormat,
+                        blend: {
+                            color: {
+                                srcFactor: 'one',
+                                dstFactor: 'one-minus-src-alpha',
+                                operation: 'add',
+                            },
+                            alpha: {
+                                srcFactor: 'one',
+                                dstFactor: 'one-minus-src-alpha',
+                                operation: 'add',
+                            },
+                        },
+                    },
+                ],
+            },
+            primitive: { topology: 'triangle-list' },
         });
     }
 
@@ -1711,18 +2058,24 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
         xBuf: GPUBuffer,
         yBuf: GPUBuffer,
         auxOrPrevXBuf: GPUBuffer,
-        prevYBuf: GPUBuffer
+        prevYBuf: GPUBuffer,
+        globalFilterBuf: GPUBuffer,
+        maskBuf: GPUBuffer
     ): GPUBindGroup {
+        const uniformBuf = this.uniformBuffer!;
         const cached = this.slotBindGroups[slot];
         if (
             cached &&
+            cached.uniformBuf === uniformBuf &&
             cached.xyBuf === xyBuf &&
             cached.colorBuf === colorBuf &&
             cached.sizeBuf === sizeBuf &&
             cached.xBuf === xBuf &&
             cached.yBuf === yBuf &&
             cached.auxOrPrevXBuf === auxOrPrevXBuf &&
-            cached.prevYBuf === prevYBuf
+            cached.prevYBuf === prevYBuf &&
+            cached.globalFilterBuf === globalFilterBuf &&
+            cached.maskBuf === maskBuf
         ) {
             return cached.bindGroup;
         }
@@ -1733,7 +2086,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
                 {
                     binding: 0,
                     resource: {
-                        buffer: this.uniformBuffer!,
+                        buffer: uniformBuf,
                         offset: 0,
                         size: UNIFORM_BINDING_SIZE,
                     },
@@ -1747,11 +2100,28 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
                 { binding: 7, resource: { buffer: this.accumBuffer! } },
                 { binding: 8, resource: { buffer: auxOrPrevXBuf } },
                 { binding: 9, resource: { buffer: prevYBuf } },
+                {
+                    binding: 10,
+                    resource: {
+                        buffer: globalFilterBuf,
+                        offset: 0,
+                        size: GLOBAL_FILTER_UNIFORM_BYTES,
+                    },
+                },
+                {
+                    binding: 11,
+                    resource: {
+                        buffer: maskBuf,
+                        offset: 0,
+                        size: SLOT_MASK_SLICE_BYTES,
+                    },
+                },
             ],
         });
 
         this.slotBindGroups[slot] = {
             bindGroup,
+            uniformBuf,
             xyBuf,
             colorBuf,
             sizeBuf,
@@ -1759,6 +2129,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             yBuf,
             auxOrPrevXBuf,
             prevYBuf,
+            globalFilterBuf,
+            maskBuf,
         };
         return bindGroup;
     }
@@ -1812,11 +2184,18 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     public render(
         camera: Camera2D,
         tileStore: TileGpuStore,
-        afterResolvePass?: (encoder: GPUCommandEncoder, targetView: GPUTextureView) => void
+        afterResolvePass?: (encoder: GPUCommandEncoder, targetView: GPUTextureView) => void,
+        projCtx?: AxisProjectionContext
     ): boolean {
         if (!this.init()) return false;
         this.ensureScreenBuffers();
-        if (!this.accumBuffer || !this.resolveBindGroup || !this.uniformBuffer || !this.dummyStorageBuffer) {
+        if (
+            !this.accumBuffer ||
+            !this.resolveBindGroup ||
+            !this.uniformBuffer ||
+            !this.dummyStorageBuffer ||
+            !this.filterResources
+        ) {
             return false;
         }
 
@@ -2007,13 +2386,62 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             this.uniformF32[base + 60] = resolvedPointOpacity;
             this.uniformF32[base + 61] = resolvedExposure;
             this.uniformF32[base + 62] = mode1RefCount;
-            this.uniformF32[base + 63] = 0.0;
+            this.uniformU32[base + 63] = 0;
         };
+
+        const xOrAux1FieldGlobal = isXSpatial
+            ? tileStore.auxField1 || tileStore.filterExtraField1
+            : xAxis.field;
+        const yOrAux2FieldGlobal = isYSpatial
+            ? tileStore.auxField2 || tileStore.filterExtraField2
+            : yAxis.field;
+
+        const resolvedProjCtx: AxisProjectionContext = projCtx ?? {
+            xAxis,
+            yAxis,
+            rootBounds: tileStore.rootBounds,
+            effectiveFlipY: false,
+            colOrigins: tileStore.colOrigins,
+        };
+
+        const { useTwoPassDim } = this.filterResources.updateFrameUniforms(
+            camera,
+            tileStore,
+            resolvedProjCtx,
+            [
+                colorSrc === 0 ? colorField : '',
+                sizeSrc === 0 ? sizeField : '',
+                xOrAux1FieldGlobal,
+                yOrAux2FieldGlobal,
+            ]
+        );
+        const globalFilterBuf = this.filterResources.globalFilterBuffer!;
+        const activeMaskBuf = this.filterResources.getActiveMaskBuffer()!;
+        const chunkOversizeLeaves = this.filterResources.hasSlotBitmask;
+
+        if (chunkOversizeLeaves) {
+            let extraChunks = 0;
+            for (let s = 0; s < limitSlots; s++) {
+                const slotObj = tileStore.slots[s];
+                if (slotObj && slotObj.visible && slotObj.activeRows > SLOT_MASK_ROWS_PER_SLICE) {
+                    extraChunks += Math.ceil(slotObj.activeRows / SLOT_MASK_ROWS_PER_SLICE) - 1;
+                }
+            }
+            if (extraChunks > 0) {
+                this.ensureUniformSlotCapacity(this.maxSlots + extraChunks);
+            }
+        }
 
         writeCommonUniforms(0);
 
-        const activeSlots: { slot: number; bindGroup: GPUBindGroup; workgroups: number }[] = [];
+        const activeSlots: {
+            uniformSlot: number;
+            maskByteOffset: number;
+            bindGroup: GPUBindGroup;
+            workgroups: number;
+        }[] = [];
         let maxSlotWritten = 0;
+        let nextExtraUniformSlot = this.maxSlots;
         const dummy = this.dummyStorageBuffer;
 
         for (let slotIdx = 0; slotIdx < limitSlots; slotIdx++) {
@@ -2025,10 +2453,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
             const colorBuf = (colorSrc === 0 ? slotObj.buffers.get(colorField) : undefined) || dummy;
             const sizeBuf = (sizeSrc === 0 ? slotObj.buffers.get(sizeField) : undefined) || dummy;
-            const xOrAux1Field = isXSpatial ? tileStore.auxField1 : xAxis.field;
-            const yOrAux2Field = isYSpatial ? tileStore.auxField2 : yAxis.field;
-            const xBuf = (xOrAux1Field ? slotObj.buffers.get(xOrAux1Field) : undefined) || dummy;
-            const yBuf = (yOrAux2Field ? slotObj.buffers.get(yOrAux2Field) : undefined) || dummy;
+            const xBuf =
+                (xOrAux1FieldGlobal ? slotObj.buffers.get(xOrAux1FieldGlobal) : undefined) || dummy;
+            const yBuf =
+                (yOrAux2FieldGlobal ? slotObj.buffers.get(yOrAux2FieldGlobal) : undefined) || dummy;
 
             const auxOrPrevXField = isTransitioning
                 ? prevIsXSpatial
@@ -2039,23 +2467,6 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             const auxOrPrevXBuf =
                 (auxOrPrevXField ? slotObj.buffers.get(auxOrPrevXField) : undefined) || dummy;
             const prevYBuf = (prevYField ? slotObj.buffers.get(prevYField) : undefined) || dummy;
-
-            const base = slotIdx * (SLOT_UNIFORM_STRIDE / 4);
-            writeCommonUniforms(base);
-            const slotBufFlags =
-                (colorBuf !== dummy ? 1 << 25 : 0) |
-                (sizeBuf !== dummy ? 1 << 26 : 0) |
-                (xBuf !== dummy ? 1 << 27 : 0) |
-                (yBuf !== dummy ? 1 << 28 : 0) |
-                (auxOrPrevXBuf !== dummy ? 1 << 29 : 0) |
-                (prevYBuf !== dummy ? 1 << 30 : 0);
-            this.uniformU32[base + 35] = (extraFlags | slotBufFlags) >>> 0;
-            this.uniformU32[base + 6] = slotObj.activeRows;
-
-            this.uniformF32[base + 8] = slotObj.tileOffsetX;
-            this.uniformF32[base + 9] = slotObj.tileOffsetY;
-            this.uniformF32[base + 10] = slotObj.tileScale;
-            this.uniformF32[base + 11] = slotObj.spawnTime;
 
             const rtcX = this.computeRtcAxis(
                 xAxis,
@@ -2073,33 +2484,34 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
                 true,
                 camTop
             );
-            this.uniformF32[base + 36] = rtcX.base;
-            this.uniformF32[base + 37] = rtcX.step;
-            this.uniformF32[base + 38] = rtcY.base;
-            this.uniformF32[base + 39] = rtcY.step;
+            const prevRtcX = isTransitioning
+                ? this.computeRtcAxis(
+                      prevCfg.x,
+                      slotObj.tileOffsetX,
+                      slotObj.tileOffsetY,
+                      slotObj.tileScale,
+                      false,
+                      camLeft
+                  )
+                : null;
+            const prevRtcY = isTransitioning
+                ? this.computeRtcAxis(
+                      prevCfg.y,
+                      slotObj.tileOffsetX,
+                      slotObj.tileOffsetY,
+                      slotObj.tileScale,
+                      true,
+                      camTop
+                  )
+                : null;
 
-            if (isTransitioning) {
-                const prevRtcX = this.computeRtcAxis(
-                    prevCfg.x,
-                    slotObj.tileOffsetX,
-                    slotObj.tileOffsetY,
-                    slotObj.tileScale,
-                    false,
-                    camLeft
-                );
-                const prevRtcY = this.computeRtcAxis(
-                    prevCfg.y,
-                    slotObj.tileOffsetX,
-                    slotObj.tileOffsetY,
-                    slotObj.tileScale,
-                    true,
-                    camTop
-                );
-                this.uniformF32[base + 52] = prevRtcX.base;
-                this.uniformF32[base + 53] = prevRtcX.step;
-                this.uniformF32[base + 54] = prevRtcY.base;
-                this.uniformF32[base + 55] = prevRtcY.step;
-            }
+            const slotBufFlags =
+                (colorBuf !== dummy ? 1 << 25 : 0) |
+                (sizeBuf !== dummy ? 1 << 26 : 0) |
+                (xBuf !== dummy ? 1 << 27 : 0) |
+                (yBuf !== dummy ? 1 << 28 : 0) |
+                (auxOrPrevXBuf !== dummy ? 1 << 29 : 0) |
+                (prevYBuf !== dummy ? 1 << 30 : 0);
 
             const bindGroup = this.getOrCreateSlotBindGroup(
                 slotIdx,
@@ -2109,14 +2521,58 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
                 xBuf,
                 yBuf,
                 auxOrPrevXBuf,
-                prevYBuf
+                prevYBuf,
+                globalFilterBuf,
+                activeMaskBuf
             );
-            activeSlots.push({
-                slot: slotIdx,
-                bindGroup,
-                workgroups: Math.ceil(slotObj.activeRows / 256),
-            });
-            maxSlotWritten = slotIdx;
+
+            const numChunks =
+                chunkOversizeLeaves && slotObj.activeRows > SLOT_MASK_ROWS_PER_SLICE
+                    ? Math.ceil(slotObj.activeRows / SLOT_MASK_ROWS_PER_SLICE)
+                    : 1;
+
+            for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+                const uniformSlot = chunkIdx === 0 ? slotIdx : nextExtraUniformSlot++;
+                const rowBaseOffset = chunkIdx * SLOT_MASK_ROWS_PER_SLICE;
+                const chunkCount =
+                    numChunks === 1
+                        ? slotObj.activeRows
+                        : Math.min(SLOT_MASK_ROWS_PER_SLICE, slotObj.activeRows - rowBaseOffset);
+                if (chunkCount <= 0) continue;
+
+                const base = uniformSlot * (SLOT_UNIFORM_STRIDE / 4);
+                writeCommonUniforms(base);
+                this.uniformU32[base + 35] = (extraFlags | slotBufFlags) >>> 0;
+                this.uniformU32[base + 6] = chunkCount;
+                this.uniformU32[base + 63] = rowBaseOffset;
+
+                this.uniformF32[base + 8] = slotObj.tileOffsetX;
+                this.uniformF32[base + 9] = slotObj.tileOffsetY;
+                this.uniformF32[base + 10] = slotObj.tileScale;
+                this.uniformF32[base + 11] = slotObj.spawnTime;
+
+                this.uniformF32[base + 36] = rtcX.base;
+                this.uniformF32[base + 37] = rtcX.step;
+                this.uniformF32[base + 38] = rtcY.base;
+                this.uniformF32[base + 39] = rtcY.step;
+
+                if (prevRtcX && prevRtcY) {
+                    this.uniformF32[base + 52] = prevRtcX.base;
+                    this.uniformF32[base + 53] = prevRtcX.step;
+                    this.uniformF32[base + 54] = prevRtcY.base;
+                    this.uniformF32[base + 55] = prevRtcY.step;
+                }
+
+                activeSlots.push({
+                    uniformSlot,
+                    maskByteOffset: this.filterResources.getMaskDynamicOffset(slotIdx, chunkIdx),
+                    bindGroup,
+                    workgroups: Math.ceil(chunkCount / 256),
+                });
+                if (uniformSlot > maxSlotWritten) {
+                    maxSlotWritten = uniformSlot;
+                }
+            }
         }
 
         const uploadBytes = (maxSlotWritten + 1) * SLOT_UNIFORM_STRIDE;
@@ -2126,35 +2582,113 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             label: 'ComputeRasterizer_CommandEncoder',
         });
 
-        encoder.clearBuffer(this.accumBuffer);
-
-        if (activeSlots.length > 0) {
-            const computePass = encoder.beginComputePass({ label: 'ComputeRasterizer_SplatPass' });
-            computePass.setPipeline(this.computePipeline);
-            for (let i = 0; i < activeSlots.length; i++) {
-                const item = activeSlots[i];
-                computePass.setBindGroup(0, item.bindGroup, [item.slot * SLOT_UNIFORM_STRIDE]);
-                computePass.dispatchWorkgroups(item.workgroups);
-            }
-            computePass.end();
-        }
-
         const currentTextureView = this.context.getCurrentTexture().createView();
-        const renderPass = encoder.beginRenderPass({
-            label: 'ComputeRasterizer_ResolvePass',
-            colorAttachments: [
-                {
-                    view: currentTextureView,
-                    clearValue: { r: 17 / 255, g: 17 / 255, b: 17 / 255, a: 1.0 },
-                    loadOp: 'clear',
-                    storeOp: 'store',
-                },
-            ],
-        });
-        renderPass.setPipeline(this.resolvePipeline);
-        renderPass.setBindGroup(0, this.resolveBindGroup);
-        renderPass.draw(3, 1, 0, 0);
-        renderPass.end();
+        const clearVal = tileStore.lightBackground
+            ? { r: 0.975, g: 0.978, b: 0.985, a: 1.0 }
+            : { r: 17 / 255, g: 17 / 255, b: 17 / 255, a: 1.0 };
+
+        if (useTwoPassDim) {
+            // Subpass 1: Splat !selected -> Resolve desaturated context cloud at `unselectedOpacity`
+            encoder.clearBuffer(this.accumBuffer);
+            if (activeSlots.length > 0) {
+                const bgCompute = encoder.beginComputePass({
+                    label: 'ComputeRasterizer_UnselectedPass',
+                });
+                bgCompute.setPipeline(this.computeUnselectedPipeline);
+                for (let i = 0; i < activeSlots.length; i++) {
+                    const item = activeSlots[i];
+                    bgCompute.setBindGroup(0, item.bindGroup, [
+                        item.uniformSlot * SLOT_UNIFORM_STRIDE,
+                        item.maskByteOffset,
+                    ]);
+                    bgCompute.dispatchWorkgroups(item.workgroups);
+                }
+                bgCompute.end();
+            }
+
+            const bgResolve = encoder.beginRenderPass({
+                label: 'ComputeRasterizer_ResolveDimBgPass',
+                colorAttachments: [
+                    {
+                        view: currentTextureView,
+                        clearValue: clearVal,
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                    },
+                ],
+            });
+            bgResolve.setPipeline(this.resolveDimBgPipeline);
+            bgResolve.setBindGroup(0, this.resolveBindGroup);
+            bgResolve.draw(3, 1, 0, 0);
+            bgResolve.end();
+
+            // Subpass 2: Clear accumBuffer -> Splat selected (full ticket budget!) -> Premultiplied overlay resolve
+            encoder.clearBuffer(this.accumBuffer);
+            if (activeSlots.length > 0) {
+                const fgCompute = encoder.beginComputePass({
+                    label: 'ComputeRasterizer_SelectedPass',
+                });
+                fgCompute.setPipeline(this.computeSelectedPipeline);
+                for (let i = 0; i < activeSlots.length; i++) {
+                    const item = activeSlots[i];
+                    fgCompute.setBindGroup(0, item.bindGroup, [
+                        item.uniformSlot * SLOT_UNIFORM_STRIDE,
+                        item.maskByteOffset,
+                    ]);
+                    fgCompute.dispatchWorkgroups(item.workgroups);
+                }
+                fgCompute.end();
+            }
+
+            const fgResolve = encoder.beginRenderPass({
+                label: 'ComputeRasterizer_ResolveFgOverlayPass',
+                colorAttachments: [
+                    {
+                        view: currentTextureView,
+                        loadOp: 'load',
+                        storeOp: 'store',
+                    },
+                ],
+            });
+            fgResolve.setPipeline(this.resolveFgOverlayPipeline);
+            fgResolve.setBindGroup(0, this.resolveBindGroup);
+            fgResolve.draw(3, 1, 0, 0);
+            fgResolve.end();
+        } else {
+            encoder.clearBuffer(this.accumBuffer);
+
+            if (activeSlots.length > 0) {
+                const computePass = encoder.beginComputePass({
+                    label: 'ComputeRasterizer_SplatPass',
+                });
+                computePass.setPipeline(this.computePipeline);
+                for (let i = 0; i < activeSlots.length; i++) {
+                    const item = activeSlots[i];
+                    computePass.setBindGroup(0, item.bindGroup, [
+                        item.uniformSlot * SLOT_UNIFORM_STRIDE,
+                        item.maskByteOffset,
+                    ]);
+                    computePass.dispatchWorkgroups(item.workgroups);
+                }
+                computePass.end();
+            }
+
+            const renderPass = encoder.beginRenderPass({
+                label: 'ComputeRasterizer_ResolvePass',
+                colorAttachments: [
+                    {
+                        view: currentTextureView,
+                        clearValue: clearVal,
+                        loadOp: 'clear',
+                        storeOp: 'store',
+                    },
+                ],
+            });
+            renderPass.setPipeline(this.resolvePipeline);
+            renderPass.setBindGroup(0, this.resolveBindGroup);
+            renderPass.draw(3, 1, 0, 0);
+            renderPass.end();
+        }
 
         if (afterResolvePass) {
             afterResolvePass(encoder, currentTextureView);
@@ -2169,7 +2703,8 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             (this.accumBuffer?.size ?? 0) +
             (this.uniformBuffer?.size ?? 0) +
             (this.paletteBuffer?.size ?? 0) +
-            (this.dummyStorageBuffer?.size ?? 0)
+            (this.dummyStorageBuffer?.size ?? 0) +
+            (this.ownsFilterResources ? (this.filterResources?.getLiveGpuBytes() ?? 0) : 0)
         );
     }
 
@@ -2192,6 +2727,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
             this.paletteBuffer.destroy();
             this.paletteBuffer = null;
         }
+        if (this.ownsFilterResources && this.filterResources) {
+            this.filterResources.dispose();
+        }
+        this.filterResources = null;
         this.resolveBindGroup = null;
         for (let i = 0; i < this.slotBindGroups.length; i++) {
             this.slotBindGroups[i] = null;

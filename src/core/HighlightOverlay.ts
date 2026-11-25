@@ -284,7 +284,8 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
         encoder: GPUCommandEncoder,
         targetView: GPUTextureView,
         camera: Camera2D,
-        tileStore: TileGpuStore
+        tileStore: TileGpuStore,
+        isMarkerVisible?: (marker: HighlightMarkerSpec) => boolean
     ): void {
         if (this.disposed) return;
         const hasHover = Boolean(this.hoverMarker);
@@ -331,6 +332,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
         let count = 0;
         for (const m of queueList) {
+            if (isMarkerVisible && !isMarkerVisible(m)) continue;
             const subX = m.xU16 / 65535.0 + (pcgHashJS(m.rawRowIdx) - 0.5) / 65535.0;
             const subY = m.yU16 / 65535.0 + (pcgHashJS(m.rawRowIdx + 12345) - 0.5) / 65535.0;
 

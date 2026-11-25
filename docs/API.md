@@ -1,6 +1,6 @@
-# Deepgraph Public JavaScript / TypeScript API (`v0.1.1`)
+# Deepgraph Public JavaScript / TypeScript API (`v0.1.2`)
 
-> **Status:** `v0.1.1` (`npm install deepgraph`; license: `CC-BY-NC-4.0` + commercial license via `erlenbusch@uchicago.edu`).
+> **Status:** `v0.1.2` (`npm install deepgraph`; license: `CC-BY-NC-4.0` + commercial license via `erlenbusch@uchicago.edu`).
 
 `Deepgraph` is an embeddable WebGPU compute scatterplot & spatial-pyramid library for streaming multi-million to billion-point **`.arrowtiles` (`v0.1`)** archives over HTTP Range requests, local `File` handles, or custom byte-range transports (`CustomRangeSource`).
 
@@ -89,6 +89,22 @@ interface DeepgraphOptions {
   maxTileCache?: number;
   /** WebGPU adapter power preference (`'high-performance'` default, or `'low-power'` to prefer integrated GPUs). */
   powerPreference?: 'high-performance' | 'low-power';
+  /** Initial canvas left-drag mode (`'pan'` default, `'brush'` 2D box/spotlight lens, or `'lasso'` freehand polygon). */
+  interactionMode?: 'pan' | 'brush' | 'lasso';
+  /** Temporary drag mode activated when holding `Shift` while left-dragging (`'brush'` default). */
+  shiftDragMode?: 'brush' | 'lasso';
+  /** Eagerly retain per-tile `(row_id, x_u16, y_u16)` indexes in Web Workers for `getSelectedRowIds()` (`false` default; enabled automatically on `setFilteredRowIds`). */
+  enableRowIdIndex?: boolean;
+  /** Initial zero-SQL GPU cross-filter (`rect`, `lasso`, `ranges`, `categories`, `unselectedOpacity`). */
+  filter?: DeepgraphFilter | null;
+  /** Initial static curved quadratic Bézier graph/kNN arcs (`<= 100,000`). */
+  edges?: ReadonlyArray<EdgeSpec>;
+  /** Initial visual styling for static and ego-network arcs (`width`, `curvature`, `opacity`, `colorHex`, `directed`, `animatePulse`). */
+  edgeStyle?: EdgeStyleOptions;
+  /** Optional async or sync 1-hop ego-network / kNN resolver `(hit, trigger, signal) => Promise<EdgeSpec[]> | EdgeSpec[]`. */
+  resolveEdges?: EgoEdgeResolver;
+  /** Whether `resolveEdges` runs on `'hover'` as well as `'click'` (`true` default). */
+  resolveEdgesOnHover?: boolean;
   /**
    * Optional async resolver (`D8(2)`) invoked on `'click'` and `plot.pickAt(...)` by default
    * to enrich `{ rowId, attributes }` with cold or dropped free-text columns (e.g. querying a
@@ -189,9 +205,16 @@ interface DeepgraphEncoding {
 | **`getViewport`** | `getViewport(): { x: number; y: number; zoom: number }` | Returns current viewport center `(x, y)` in **data coordinates** (`dataBounds` when spatial, active axis `domain` on chart axes) and camera `zoom`. |
 | **`setViewport`** | `setViewport(vp: { x?: number; y?: number; zoom?: number }): void` | Pans/zooms the viewport using **data coordinates** `(x, y)` and magnification `zoom`. |
 | **`fitView`** | `fitView(): void` | Resets camera center and zoom to frame the full active dataset bounds. |
-| **`pickAt`** | `pickAt(cssX: number, cssY: number): Promise<PointHitEvent \| null>` | Dispatches a `9×9 CSS px` GPU picking pass around `(cssX, cssY)` (`1 KB` `slotBestHit` buffer, breaking ties by coarser zoom `z` then `rawRowIdx`) and decodes `row_id` + retained columns directly from `.arrowtiles` on demand. |
-| **`on` / `off`** | `on(event, handler): () => void` / `off(event, handler): void` | Subscribes or unsubscribes from typed events (`click`, `hover`, `select`, `telemetry`, `load`, `error`). `on(...)` returns an unsubscribe function. |
-| **`destroy`** | `destroy(): void` | Cancels any in-flight `load()`, terminates Web Workers, destroys all `TileGpuStore`, `ComputeRasterizer`, `PickingLayer`, and `HighlightOverlay` `GPUBuffer`s, unconfigures the WebGPU swapchain context, calls `device.destroy()`, removes `ResizeObserver` & pointer/wheel listeners, and removes `<canvas>` from `container`. |
+| **`pickAt`** | `pickAt(cssX: number, cssY: number): Promise<PointHitEvent \| null>` | Dispatches a `9×9 CSS px` GPU picking pass around `(cssX, cssY)` (`1 KB` `slotBestHit` buffer, breaking ties by coarser zoom `z` then `rawRowIdx`) and decodes `row_id` + retained columns directly from `.arrowtiles` on demand (skipping filtered-out and dimmed context points). |
+| **`setInteractionMode` / `getInteractionMode`** | `setInteractionMode(mode: 'pan' \| 'brush' \| 'lasso'): void` | Switches left-drag canvas pointer mode (`'pan'` default; `Shift+drag` triggers `shiftDragMode`, and dragging inside an active `'brush'` rectangle translates it smoothly as a spotlight lens). |
+| **`setFilter` / `getFilter`** | `setFilter(filter: DeepgraphFilter \| null): void` | Applies or clears a zero-SQL GPU cross-filter (`rect`, `lasso`, `ranges`, `categories`, `unselectedOpacity`) evaluated at `60–180 FPS` inside `@binding(10)` uniforms (using a 2-pass premultiplied resolve when `unselectedOpacity > 0` in Mode `0`/`1`, and hard-culling Mode `2` mean fields). |
+| **`canApplyFilterOnGpu`** | `canApplyFilterOnGpu(filter: DeepgraphFilter \| null): boolean` | Returns `true` when `filter` fits completely within the GPU uniform fast path (`<= 6` GPU-resident range slots including up to `2` idle spatial slots, and `<= 2` categorical columns with `< 512` codes). |
+| **`setFilteredRowIds`** | `setFilteredRowIds(ids: Iterable<number \| bigint \| string> \| Uint32Array \| BigUint64Array \| null): Promise<void>` | Compiles per-slot `32 KiB` (`262,144`-bit, `vec4<u32>`-aligned) `@binding(11)` visibility bitmasks in Web Workers (`0` main-thread $O(N)$ loops; lazily allocated and `.destroy()`ed when cleared). |
+| **`clearSelection`** | `clearSelection(): void` | Clears any active interactive `rect`/`lasso` selection, selected point rings, and click-pinned ego-graph arcs. |
+| **`getSelectedRowIds`** | `getSelectedRowIds(): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }>` | Queries loaded visible spatial tiles in Web Workers (intersected with any active `setFilteredRowIds` bitmask) for `row_id`s matching the active spatial brush/lasso or clicked point. On non-spatial chart axes (or to query all `N` rows including unloaded deep tiles), evaluate `PointSelectEvent.clause` in DuckDB/Mosaic. |
+| **`setEdges` / `setEdgeStyle`** | `setEdges(edges: ReadonlyArray<EdgeSpec>, style?: EdgeStyleOptions): void` | Renders up to `100,000` anti-aliased curved quadratic Bézier graph/kNN arcs via `EdgeOverlay` (`0` storage buffers, `Float64` RTC uniforms, complementary `A→B` / `B→A` curvature, and 2-second axis transitions). |
+| **`on` / `off`** | `on(event, handler): () => void` / `off(event, handler): void` | Subscribes or unsubscribes from typed events (`click`, `hover`, `select`, `brush`, `telemetry`, `load`, `error`). `on(...)` returns an unsubscribe function. |
+| **`destroy`** | `destroy(): void` | Cancels any in-flight `load()`, terminates Web Workers, destroys all `TileGpuStore`, `ComputeRasterizer`, `FilterGpuResources`, `PickingLayer`, `EdgeOverlay`, `SelectionOverlay`, and `HighlightOverlay` `GPUBuffer`s, unconfigures the WebGPU swapchain context, calls `device.destroy()`, removes `ResizeObserver` & pointer/wheel listeners, and removes `<canvas>` from `container`. |
 
 ---
 
@@ -204,7 +227,37 @@ interface DeepgraphEncoding {
 | `'error'` | `Error` | Fired on uncaptured WebGPU device errors, point-decode / `resolveRowAttributes` exceptions, or fatal render-loop errors. |
 | `'click'` | `PointHitEvent \| null` | Triggered on `< 4 CSS px` pointer clicks via the `9×9 CSS px` GPU `PickingLayer`, returning `{ rowId: number, rowIdBigInt?: bigint, screenX, screenY, dataX, dataY, attributes }` decoded directly from `.arrowtiles` (plus optional `resolveRowAttributes`), or `null` on empty space. |
 | `'hover'` | `PointHitEvent \| null` | Throttled (`45 ms`), single-in-flight pointer-hover hit event (dispatched only when at least one `'hover'` listener is attached). Renders the cyan hover ring immediately from GPU winner coordinates (`0 ms` network wait), deduplicates repeated hovers over the same point, reuses a byte-capped (`<= 8` tiles / `<= 24 MiB`) compressed-tile LRU + 1-tile worker Arrow `Table` cache (`O(1)` consecutive intra-tile lookups), cancels stale decodes via `AbortSignal`, and clears automatically (`hover: null`) on `pointerleave`. |
-| `'select'` | `PointSelectEvent` | Emitted alongside `'click'` with `{ points: PointHitEvent[] }` (`[hit]` on hit, `[]` on background click) + selected accent ring overlay. |
+| `'select'` | `PointSelectEvent` | Emitted on committed point click, `pointerup` after `'brush'`/`'lasso'` drag, or brush clear (`{ points, clause?: SelectionGeometryClause, rowIds?, rowIdsBigInt? }`). |
+| `'brush'` | `SelectionGeometryClause` | Throttled (`16 ms`) live selection geometry (`kind: 'rect' \| 'lasso' \| 'none'`, `xField`, `yField`, `rect`, `lasso`) emitted during interactive drag. |
+
+---
+
+## 5b. Hybrid UW Mosaic Integration (`deepgraph/mosaic`)
+
+`deepgraph/mosaic` is an optional peer-dependency subpath (`@uwdata/mosaic-core`, `@uwdata/mosaic-sql`) that adds `0 B` to `deepgraph` and `deepgraph/standalone`:
+
+```ts
+import { Deepgraph } from 'deepgraph';
+import { DeepgraphMosaicClient, buildLassoDuckDbSql } from 'deepgraph/mosaic';
+import { Selection, coordinator } from '@uwdata/mosaic-core';
+
+const brush = Selection.crossfilter();
+const client = new DeepgraphMosaicClient({
+  plot,
+  table: 'conversations',
+  rowIdColumn: 'row_id',
+  xColumn: 'x_umap',
+  yColumn: 'y_umap',
+  as: brush,
+  filterBy: brush,
+  coordinator: coordinator(),
+  unselectedOpacity: 0.08,
+});
+```
+
+- **Path A (`0` SQL queries, `< 0.25 ms`):** Interval, categorical (`<= 512` codes), and 2D brush/lasso predicates targeting GPU-resident columns (`canApplyFilterOnGpu(filter) === true`) execute directly on `@binding(10)` uniforms with zero database round-trips.
+- **Path B (DuckDB `row_id` Escape Hatch):** Cold/text columns (`ILIKE`), `OR`-unions, or high-cardinality predicates automatically query `SELECT row_id FROM <table> WHERE <predicate>` through the Mosaic `Coordinator` and compile `@binding(11)` `32 KiB` worker bitmasks.
+- **Outbound Lasso Pushdown:** `buildLassoDuckDbSql(xCol, yCol, points)` emits an axis-aligned `BETWEEN` zonemap pushdown guard plus a division-free inline SQL even-odd polygon test (requiring zero DuckDB C++ extensions).
 
 ---
 
@@ -238,6 +291,7 @@ const skySurveyPreset: DeepgraphPreset = {
 - **`"exports"`:**
   - **`"."`** (`import { Deepgraph } from 'deepgraph'`): `{ "types": "./dist/index.d.ts", "import": "./dist/index.js" }` — **Bundler entry** externalizing main-thread runtime dependencies (`pmtiles`, `p-queue`, `fflate`, `@uwdata/flechette`, `@bokuweb/zstd-wasm`) with **`0 B` main-thread Arrow parser weight** while keeping `dist/assets/pmtiles.worker-*.js` (`@uwdata/flechette` + base64 `zstd.wasm`) self-contained.
   - **`"./standalone"`** (`import { Deepgraph } from 'deepgraph/standalone'`): `{ "types": "./dist/index.d.ts", "import": "./dist/standalone.js" }` — **Single-file zero-build standalone entry** bundling all runtime dependencies AND inlining the Web Worker as a cached `Blob` URL (`URL.createObjectURL`), working directly from `<script type="module">` HTML pages ([`examples/embed.html`](../examples/embed.html)), `blob:` URLs, `esm.sh`, and Jupyter `anywidget` notebooks.
+  - **`"./mosaic"`** (`import { DeepgraphMosaicClient, buildLassoDuckDbSql } from 'deepgraph/mosaic'`): `{ "types": "./dist/mosaic.d.ts", "import": "./dist/mosaic.js" }` — **Optional UW Mosaic adapter** externalizing `@uwdata/mosaic-core` and `@uwdata/mosaic-sql` with structural TypeScript declarations (`0` leaked `@duckdb/duckdb-wasm` or `@uwdata/flechette` `.d.ts` imports).
 - **`"main"` / `"module"`:** `"./dist/index.js"` (`"type": "module"`, `"sideEffects": false`)
 - **`"types"`:** `"./dist/index.d.ts"` (emitted with `"rootDir": "./src"` and `"stripInternal": true`, rewritten to `.js` relative specifiers so standard downstream TypeScript projects pass `tsc --noEmit` under both `bundler` and `nodenext` without `allowImportingTsExtensions` or `@webgpu/types`)
 - **`"license"`:** `"CC-BY-NC-4.0"` (free for non-commercial use; commercial use requires a separate license via `erlenbusch@uchicago.edu` — see `LICENSE` and `NOTICE`; `"name": "deepgraph"`, `"files": ["dist", "docs/API.md", "LICENSE", "NOTICE"]`)
@@ -246,11 +300,11 @@ const skySurveyPreset: DeepgraphPreset = {
 
 | Script | Output / Check |
 | :--- | :--- |
-| `npm run build` / `npm run build:lib` | Builds both the externalized bundler entry (`dist/index.js` + self-contained `dist/assets/pmtiles.worker-*.js`) and the single-file standalone entry (`dist/standalone.js` with cached `Blob` worker), and emits clean TypeScript declarations (`dist/index.d.ts`, `dist/lib/types.d.ts`). |
-| `npm run verify:types` | Runs external consumer `tsc --noEmit` under both `"moduleResolution": "bundler"` and `"moduleResolution": "nodenext"` (`allowImportingTsExtensions` disabled, `skipLibCheck: false`, `types: []`, testing both `"."` and `"./standalone"`) **plus** a real `vite build` consumer application importing `dist/index.js` alongside `@uwdata/flechette`. |
-| `npm run test:unit` | Runs fast Node.js (`node:test`) unit tests covering `@uwdata/flechette` worker IPC codecs (`Utf8View`, `Decimal128`, `Timestamp`, `Date32`, `Float16`, `Dictionary`, `BigInt > 2^53-1`, `1D RTO` `colOrigins`, Zstd bomb rejection) and `ViewState` / `DatasetSession` invariants. |
+| `npm run build` / `npm run build:lib` | Builds the externalized bundler entry (`dist/index.js` + self-contained `dist/assets/pmtiles.worker-*.js`), single-file standalone entry (`dist/standalone.js` with cached `Blob` worker), and optional UW Mosaic adapter (`dist/mosaic.js`), and emits verified TypeScript declarations (`dist/index.d.ts`, `dist/lib/types.d.ts`, `dist/mosaic.d.ts`). |
+| `npm run verify:types` | Runs external consumer `tsc --noEmit` under both `"moduleResolution": "bundler"` and `"moduleResolution": "nodenext"` (`allowImportingTsExtensions` disabled, `skipLibCheck: false`, `types: []`, testing `"."`, `"./standalone"`, and `"./mosaic"` without requiring `@uwdata/mosaic-*` installed) **plus** a real `vite build` consumer application. |
+| `npm run test:unit` | Runs fast Node.js (`node:test`) unit tests covering `@uwdata/flechette` worker IPC codecs (`Utf8View`, `Decimal128`, `Timestamp`, `Date32`, `Float16`, `Dictionary`, `BigInt > 2^53-1`, `1D RTO` `colOrigins`, Zstd bomb rejection), `ViewState`, Ramer–Douglas–Peucker lasso simplification, `32 KiB` `u32`/`u64` bitmask slicing, and `DeepgraphMosaicClient` Path A/Path B + division-free DuckDB SQL. |
 | `npm run build:demo` | Builds the standalone interactive `lil-gui` demo application into `dist-demo/` (`copyPublicDir: false`). |
-| `npm run test:e2e` | Runs the 3 fast Playwright WebGPU specs (`library-embed`, `phase8b-hdr-density`, `picking-layer`) against `< 5 MiB` sample archives in sibling `../arrowtiles/samples/`. |
+| `npm run test:e2e` | Runs the 5 fast Playwright WebGPU specs (`library-embed`, `phase8b-hdr-density`, `picking-layer`, `brush-mosaic`, `ego-edges`) on Intel iGPU against `< 5 MiB` sample archives in sibling `../arrowtiles/samples/`. |
 | `npm run test:e2e:heavy` | Runs the 5-gate VRAM & LRU lifecycle stress suite (`gpu-vram-lifecycle.spec.ts`) against local `public/gaia_full.arrowtiles` (or `DEEPGRAPH_GAIA_FILE`) and `../arrowtiles/samples/lmsys_d7_proportional_25k.arrowtiles`. |
 
 ### Bundled vs. Externalized Dependencies & Zero-Config Worker / WASM Loading

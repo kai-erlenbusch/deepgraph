@@ -15,7 +15,7 @@ execFileSync(process.execPath, [tscCli, '-p', path.join(rootDir, 'tsconfig.build
 });
 
 // 2. Prune internal unreferenced .d.ts files so only the sealed public declaration graph ships
-const allowedDtsRel = new Set(['index.d.ts', path.join('lib', 'types.d.ts')]);
+const allowedDtsRel = new Set(['index.d.ts', 'mosaic.d.ts', path.join('lib', 'types.d.ts')]);
 
 function walkFiles(dir) {
     const out = [];
@@ -80,6 +80,10 @@ for (const dtsPath of dtsFiles) {
         'lil-gui',
         'three',
         'apache-arrow',
+        '@uwdata/mosaic-core',
+        '@uwdata/mosaic-sql',
+        '@uwdata/flechette',
+        '@duckdb/duckdb-wasm',
     ]) {
         if (content.includes(forbidden)) {
             throw new Error(`Forbidden internal/retired symbol '${forbidden}' leaked into ${dtsPath}`);
@@ -89,11 +93,16 @@ for (const dtsPath of dtsFiles) {
 
 const distIndexPath = path.join(distDir, 'index.js');
 const distStandalonePath = path.join(distDir, 'standalone.js');
+const distMosaicPath = path.join(distDir, 'mosaic.js');
+const distMosaicDtsPath = path.join(distDir, 'mosaic.d.ts');
 if (!fs.existsSync(distIndexPath)) {
     throw new Error('Missing bundler entry dist/index.js');
 }
 if (!fs.existsSync(distStandalonePath)) {
     throw new Error('Missing self-contained entry dist/standalone.js');
+}
+if (!fs.existsSync(distMosaicPath) || !fs.existsSync(distMosaicDtsPath)) {
+    throw new Error('Missing optional Mosaic subpath dist/mosaic.js or dist/mosaic.d.ts');
 }
 
 function findBareImports(jsCode) {
@@ -118,20 +127,58 @@ for (const expectedExt of ['pmtiles', 'p-queue', 'fflate']) {
         );
     }
 }
-for (const forbiddenMainArrow of ['apache-arrow', '@uwdata/flechette']) {
+for (const forbiddenMainArrow of [
+    'apache-arrow',
+    '@uwdata/flechette',
+    '@uwdata/mosaic-core',
+    '@uwdata/mosaic-sql',
+    '@duckdb/duckdb-wasm',
+]) {
     if (indexBareImports.includes(forbiddenMainArrow) || indexJs.includes(forbiddenMainArrow)) {
         throw new Error(
-            `Main-thread dist/index.js must carry 0 B Arrow parser weight, found '${forbiddenMainArrow}'`
+            `Main-thread dist/index.js must carry 0 B Arrow/Mosaic/DuckDB weight, found '${forbiddenMainArrow}'`
         );
     }
 }
-if (Buffer.byteLength(indexJs, 'utf8') > 220 * 1024) {
+if (Buffer.byteLength(indexJs, 'utf8') > 325 * 1024) {
     throw new Error(
-        `dist/index.js (${Buffer.byteLength(indexJs, 'utf8')} B) exceeds 220 KiB externalized bundler ceiling`
+        `dist/index.js (${Buffer.byteLength(indexJs, 'utf8')} B) exceeds 325 KiB externalized bundler ceiling`
     );
 }
 
 const standaloneJs = fs.readFileSync(distStandalonePath, 'utf8');
+for (const forbiddenStandalone of [
+    '@uwdata/mosaic-core',
+    '@uwdata/mosaic-sql',
+    '@duckdb/duckdb-wasm',
+    'apache-arrow',
+]) {
+    if (standaloneJs.includes(forbiddenStandalone)) {
+        throw new Error(
+            `dist/standalone.js must carry 0 B Mosaic/DuckDB/apache-arrow weight, found '${forbiddenStandalone}'`
+        );
+    }
+}
+
+const mosaicJs = fs.readFileSync(distMosaicPath, 'utf8');
+const mosaicBareImports = findBareImports(mosaicJs);
+for (const expectedMosaicExt of ['@uwdata/mosaic-core', '@uwdata/mosaic-sql']) {
+    if (!mosaicBareImports.includes(expectedMosaicExt)) {
+        throw new Error(
+            `Expected dist/mosaic.js to externalize '${expectedMosaicExt}', found imports: ${JSON.stringify(mosaicBareImports)}`
+        );
+    }
+}
+for (const forbiddenMosaic of ['apache-arrow', '@duckdb/duckdb-wasm', '@uwdata/flechette']) {
+    if (mosaicJs.includes(forbiddenMosaic)) {
+        throw new Error(`dist/mosaic.js must not bundle '${forbiddenMosaic}'`);
+    }
+}
+if (Buffer.byteLength(mosaicJs, 'utf8') > 32 * 1024) {
+    throw new Error(
+        `dist/mosaic.js (${Buffer.byteLength(mosaicJs, 'utf8')} B) exceeds 32 KiB subpath ceiling`
+    );
+}
 const standaloneBareImports = findBareImports(standaloneJs);
 if (standaloneBareImports.length > 0) {
     throw new Error(

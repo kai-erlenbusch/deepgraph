@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.arrowtiles binary
+*.pmtiles binary
+*.parquet binary
+*.duckdb binary
+*.wasm binary
+*.png binary
+*.jpg binary

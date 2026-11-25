@@ -62,10 +62,19 @@ import {
     type DeepgraphOptions,
     type DeepgraphPlot,
     type DeepgraphEncoding,
+    type DeepgraphFilter,
+    type EdgeSpec,
+    type InteractionMode,
     type PointHitEvent,
+    type PointSelectEvent,
     type DatasetMetadataSummary,
 } from 'deepgraph';
 import { Deepgraph as StandaloneDeepgraph } from 'deepgraph/standalone';
+import {
+    DeepgraphMosaicClient,
+    buildLassoDuckDbSql,
+    type DeepgraphMosaicOptions,
+} from 'deepgraph/mosaic';
 
 export async function mountConsumer(el: HTMLElement): Promise<DeepgraphPlot> {
     if (!Deepgraph.isSupported() || !StandaloneDeepgraph.isSupported()) {
@@ -92,10 +101,30 @@ export async function mountConsumer(el: HTMLElement): Promise<DeepgraphPlot> {
         pointOpacity: 'auto',
         exposure: 'auto',
     };
+    const filt: DeepgraphFilter = {
+        rect: { minX: -1, maxX: 1, minY: -1, maxY: 1 },
+        ranges: { num_of_tokens: [10, 500] },
+        unselectedOpacity: 0.08,
+    };
+    const edges: EdgeSpec[] = [
+        { source: { x: 0, y: 0 }, target: { x: 1, y: 1 }, weight: 0.8, directed: true },
+    ];
+    const mode: InteractionMode = 'brush';
     const opts: DeepgraphOptions = {
         url: '/samples/lmsys_sample.arrowtiles',
         powerPreference: 'low-power',
         encoding: enc,
+        interactionMode: mode,
+        filter: filt,
+        edges,
+        resolveEdges: async (hit) => [
+            {
+                source: { x: hit.dataX, y: hit.dataY },
+                target: { x: 0, y: 0 },
+                sourceAttributes: hit.attributes,
+                targetAttributes: { num_of_tokens: null },
+            },
+        ],
         resolveRowAttributesOnHover: true,
         resolveRowAttributes: async (rowId, attrs, rowIdBigInt, signal) => {
             if (signal?.aborted) return attrs;
@@ -108,9 +137,29 @@ export async function mountConsumer(el: HTMLElement): Promise<DeepgraphPlot> {
     const plot = await Deepgraph.create(el, opts);
     const meta: DatasetMetadataSummary | null = plot.getMetadata();
     void meta;
+    const canGpu: boolean = plot.canApplyFilterOnGpu(filt);
+    void canGpu;
+    await plot.setFilteredRowIds([1n, 2n]);
+    await plot.setFilteredRowIds(null);
     plot.on('click', (hit: PointHitEvent | null) => {
         if (hit) console.log(hit.rowId, hit.dataX, hit.dataY);
     });
+    plot.on('select', (ev: PointSelectEvent) => {
+        console.log(ev.clause?.kind, ev.points.length);
+    });
+    const sqlStr: string = buildLassoDuckDbSql('x', 'y', [
+        [0, 0],
+        [1, 0],
+        [0, 1],
+    ]);
+    void sqlStr;
+    const mosaicOpts: DeepgraphMosaicOptions = {
+        plot,
+        table: 'items',
+        coordinator: null,
+    };
+    const mc = new DeepgraphMosaicClient(mosaicOpts);
+    mc.destroy();
     const picked: PointHitEvent | null = await plot.pickAt(100, 100);
     void picked;
     return plot;
@@ -176,17 +225,28 @@ export async function mountConsumer(el: HTMLElement): Promise<DeepgraphPlot> {
         }
     );
 
-    // Check 3: Real `vite build` Consumer App importing externalized `dist/index.js` + `@uwdata/flechette`!
+    // Check 3: Real `vite build` Consumer App importing externalized `dist/index.js`, `deepgraph/mosaic`, & `@uwdata/flechette`!
+    for (const mosaicDep of ['@uwdata/mosaic-core', '@uwdata/mosaic-sql', '@duckdb/duckdb-wasm', 'apache-arrow', 'qs', 'tslib', 'flatbuffers']) {
+        if (fs.existsSync(path.join(rootDir, 'node_modules', mosaicDep))) {
+            linkRootDep(nmRoot, mosaicDep);
+        }
+    }
     const viteAppTs = `
 import { Deepgraph } from 'deepgraph';
+import { DeepgraphMosaicClient, buildLassoDuckDbSql } from 'deepgraph/mosaic';
+import { Selection } from '@uwdata/mosaic-core';
 import { tableFromArrays } from '@uwdata/flechette';
 
 const sharedTable = tableFromArrays({ v: new Int32Array([1, 2, 3]) });
 const stage = document.getElementById('stage');
-if (stage && Deepgraph.isSupported() && sharedTable.numRows === 3) {
+const polySql = buildLassoDuckDbSql('x', 'y', [[0, 0], [1, 0], [0, 1]]);
+if (stage && Deepgraph.isSupported() && sharedTable.numRows === 3 && polySql.length > 0) {
+    const brush = Selection.crossfilter();
     void Deepgraph.create(stage, {
         url: '/samples/lmsys_sample.arrowtiles',
         powerPreference: 'low-power',
+    }).then((plot) => {
+        new DeepgraphMosaicClient({ plot, table: 'lmsys', as: brush, filterBy: brush, coordinator: null });
     });
 }
 `;

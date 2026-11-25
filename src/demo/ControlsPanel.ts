@@ -2,6 +2,7 @@ import GUI from 'lil-gui';
 import type {
     DatasetMetadataSummary,
     DeepgraphPlot,
+    InteractionMode,
     PointHitEvent,
     TelemetrySnapshot,
     ViewOptionsPatch,
@@ -194,9 +195,11 @@ export class ControlsPanel {
     private unsubTelemetry: (() => void) | null = null;
     private unsubClick: (() => void) | null = null;
     private unsubHover: (() => void) | null = null;
+    private unsubBrush: (() => void) | null = null;
     private inspectEl: HTMLElement | null = null;
     private selectedHit: PointHitEvent | null = null;
     private hoverHit: PointHitEvent | null = null;
+    private demoSampledNodes: PointHitEvent[] = [];
 
     constructor(plot: DeepgraphPlot) {
         this.plot = plot;
@@ -208,15 +211,31 @@ export class ControlsPanel {
             this.refreshLegend();
             this.selectedHit = null;
             this.hoverHit = null;
+            this.demoSampledNodes = [];
             this.renderInspectCard();
         });
         this.unsubClick = this.plot.on('click', (hit) => {
             this.selectedHit = hit;
             this.renderInspectCard();
+            this.refreshDemoEgoArcs();
         });
         this.unsubHover = this.plot.on('hover', (hit) => {
             this.hoverHit = hit;
             this.renderInspectCard();
+            if (!this.selectedHit) {
+                this.refreshDemoEgoArcs();
+            }
+        });
+        this.unsubBrush = this.plot.on('brush', (clause) => {
+            if (clause.kind !== 'none' && this.guiState && this.guiState.unselectedOpacity > 0) {
+                const cur = this.plot.getFilter();
+                if (cur && cur.unselectedOpacity !== this.guiState.unselectedOpacity) {
+                    this.plot.setFilter({
+                        ...cur,
+                        unselectedOpacity: this.guiState.unselectedOpacity,
+                    });
+                }
+            }
         });
         this.unsubTelemetry = this.plot.on('telemetry', (snap) => {
             if (this.guiState?.animateFlow && this.trailTimeCtrl) {
@@ -294,6 +313,18 @@ export class ControlsPanel {
             exposureValue: typeof vs.exposure === 'number' ? vs.exposure : 1.0,
             autoOpacity: vs.pointOpacity === 'auto',
             opacityValue: typeof vs.pointOpacity === 'number' ? vs.pointOpacity : 0.15,
+            interactionMode: this.plot.getInteractionMode(),
+            unselectedOpacity: this.plot.getFilter()?.unselectedOpacity ?? 0.12,
+            demoEgoArcs: false,
+            animateArcPulse: false,
+            clearSelection: () => {
+                this.selectedHit = null;
+                this.plot.clearSelection();
+                if (!this.guiState?.demoEgoArcs) {
+                    this.plot.setEdges([]);
+                }
+                this.renderInspectCard();
+            },
         };
         this.guiState = state;
 
@@ -626,6 +657,41 @@ export class ControlsPanel {
                 pushStateToPlot();
             });
 
+        const selGraphFolder = gui.addFolder('Selection & Graph');
+        selGraphFolder
+            .add(state, 'interactionMode', ['pan', 'brush', 'lasso'])
+            .name('Pointer Mode')
+            .onChange((val: InteractionMode) => {
+                this.plot.setInteractionMode(val);
+            });
+        selGraphFolder
+            .add(state, 'unselectedOpacity', 0.0, 0.5, 0.02)
+            .name('Unselected Dim')
+            .onChange((val: number) => {
+                const cur = this.plot.getFilter();
+                if (cur) {
+                    this.plot.setFilter({ ...cur, unselectedOpacity: val });
+                }
+            });
+        selGraphFolder
+            .add(state, 'demoEgoArcs')
+            .name('Sample Ego Arcs')
+            .onChange(async (enabled: boolean) => {
+                if (!enabled) {
+                    this.plot.setEdges([]);
+                    return;
+                }
+                await this.ensureDemoSampledNodes();
+                this.refreshDemoEgoArcs();
+            });
+        selGraphFolder
+            .add(state, 'animateArcPulse')
+            .name('Animate Arc Pulse')
+            .onChange((val: boolean) => {
+                this.plot.setEdgeStyle({ animatePulse: val });
+            });
+        selGraphFolder.add(state, 'clearSelection').name('Clear Selection');
+
         if (isGaia) {
             const motionFolder = gui.addFolder('Astrophysics & Motion');
             motionFolder
@@ -673,10 +739,69 @@ export class ControlsPanel {
         if (this.unsubTelemetry) this.unsubTelemetry();
         if (this.unsubClick) this.unsubClick();
         if (this.unsubHover) this.unsubHover();
+        if (this.unsubBrush) this.unsubBrush();
         if (this.inspectEl) {
             this.inspectEl.remove();
             this.inspectEl = null;
         }
+    }
+
+    private async ensureDemoSampledNodes(): Promise<void> {
+        if (this.demoSampledNodes.length >= 24) return;
+        const canvas = document.querySelector('#app canvas') as HTMLCanvasElement | null;
+        if (!canvas) return;
+        const w = canvas.clientWidth;
+        const h = canvas.clientHeight;
+        const nodes = new Map<number, PointHitEvent>();
+        for (let gx = 0.18; gx <= 0.82; gx += 0.06) {
+            for (let gy = 0.14; gy <= 0.86; gy += 0.07) {
+                const p = await this.plot.pickAt(w * gx, h * gy);
+                if (p && !nodes.has(p.rowId)) {
+                    nodes.set(p.rowId, p);
+                }
+            }
+        }
+        this.demoSampledNodes = Array.from(nodes.values());
+    }
+
+    private refreshDemoEgoArcs(): void {
+        if (!this.guiState?.demoEgoArcs) return;
+        const hub = this.selectedHit ?? this.hoverHit;
+        if (!hub || this.demoSampledNodes.length === 0) {
+            this.plot.setEdges([]);
+            return;
+        }
+        const colorCol = this.plot.getViewState().colorField;
+        const hubVal = colorCol ? hub.attributes[colorCol] : undefined;
+        const matching =
+            colorCol && hubVal !== undefined && hubVal !== null
+                ? this.demoSampledNodes.filter(
+                      (n) => n.rowId !== hub.rowId && n.attributes[colorCol] === hubVal
+                  )
+                : [];
+        const candidates = (
+            matching.length >= 3
+                ? matching
+                : this.demoSampledNodes.filter((n) => n.rowId !== hub.rowId)
+        ).slice(0, 32);
+
+        this.plot.setEdges(
+            candidates.map((t, idx) => ({
+                sourceRowId: hub.rowId,
+                targetRowId: t.rowId,
+                source: { x: hub.dataX, y: hub.dataY },
+                target: { x: t.dataX, y: t.dataY },
+                sourceAttributes: hub.attributes,
+                targetAttributes: t.attributes,
+                weight: 1.0 - (idx / Math.max(1, candidates.length)) * 0.65,
+            })),
+            {
+                width: [0.9, 2.4],
+                curvature: 0.18,
+                opacity: 0.78,
+                animatePulse: Boolean(this.guiState?.animateArcPulse),
+            }
+        );
     }
 
     private ensureInspectElement(): HTMLElement {

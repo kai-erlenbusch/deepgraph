@@ -502,6 +502,31 @@ export class DatasetSession {
         this.tileClient.setRequestedColumns(cols);
     }
 
+    public setRetainRowIds(enabled: boolean): void {
+        this.tileClient.setRetainRowIds(enabled);
+    }
+
+    public setRowIdFilter(
+        ids: Iterable<number | bigint | string> | Uint32Array | BigUint64Array | null,
+        probeRowIds?: BigUint64Array | null
+    ): Promise<{ masks: Map<string, ArrayBuffer[]>; probeMatches: Uint8Array | null }> {
+        return this.tileClient.setRowIdFilter(ids, probeRowIds);
+    }
+
+    public queryLoadedSpatialSelection(spec: {
+        rect?: { minX: number; maxX: number; minY: number; maxY: number } | null;
+        lasso?: ReadonlyArray<readonly [number, number]> | null;
+        effectiveFlipY: boolean;
+    }): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }> {
+        return this.tileClient.queryLoadedSpatialSelection({
+            rect: spec.rect,
+            lasso: spec.lasso,
+            dataBounds: this.summary.dataBounds,
+            rootBounds: this.summary.rootBounds,
+            effectiveFlipY: spec.effectiveFlipY,
+        });
+    }
+
     public releaseTileCpuBuffers(tile: TileData): void {
         this.tileClient.releaseTileCpuBuffers(tile);
     }

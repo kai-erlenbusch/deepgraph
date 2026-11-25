@@ -1,9 +1,17 @@
+import {
+    buildSharedFilterWGSL,
+    FilterGpuResources,
+    GLOBAL_FILTER_UNIFORM_BYTES,
+    SLOT_MASK_ROWS_PER_SLICE,
+    SLOT_MASK_SLICE_BYTES,
+    type AxisProjectionContext,
+} from './FilterGpuResources.ts';
 import type { Camera2D, Renderer } from './Renderer.ts';
 import type { InternalAxisConfig, TileGpuStore } from './TileGpuStore.ts';
 
 const SLOT_UNIFORM_STRIDE = 256;
 const UNIFORM_BINDING_SIZE = 240; // 60 x 4-byte scalars (16-byte aligned, <= 256)
-const MAX_ROWS_PER_CHUNK = 0xfffff; // 1,048,575 (20-bit row index)
+const MAX_ROWS_PER_CHUNK = SLOT_MASK_ROWS_PER_SLICE; // 262,144 (exact 32 KiB mask slice & <= 20-bit localRowIdx)
 const NO_HIT_SENTINEL = 0xffffffff;
 const WINNER_COORD_READBACK_BYTES = 32; // [packedXY_u32, x_f32, y_f32, prevX_f32, prevY_f32, pad...]
 
@@ -29,6 +37,8 @@ interface CachedPickBindGroup {
     yBuf: GPUBuffer;
     prevXBuf: GPUBuffer;
     prevYBuf: GPUBuffer;
+    globalFilterBuf: GPUBuffer;
+    maskBuf: GPUBuffer;
 }
 
 /**
@@ -49,6 +59,8 @@ export class PickingLayer {
 
     private pipeline!: GPUComputePipeline;
     private bindGroupLayout!: GPUBindGroupLayout;
+    private filterResources: FilterGpuResources | null = null;
+    private ownsFilterResources = false;
 
     private uniformBuffer: GPUBuffer | null = null;
     private uniformArrayBuffer: ArrayBuffer;
@@ -70,9 +82,14 @@ export class PickingLayer {
     private disposed = false;
     private activePickPromise: Promise<GpuPickWinner | null> | null = null;
 
-    constructor(rendererWrapper: Renderer, maxSlots = 264) {
+    constructor(
+        rendererWrapper: Renderer,
+        maxSlots = 264,
+        filterResources?: FilterGpuResources
+    ) {
         this.rendererWrapper = rendererWrapper;
         this.maxSlots = Math.max(64, maxSlots);
+        this.filterResources = filterResources ?? null;
         this.uniformArrayBuffer = new ArrayBuffer(this.maxSlots * SLOT_UNIFORM_STRIDE);
         this.uniformF32 = new Float32Array(this.uniformArrayBuffer);
         this.uniformU32 = new Uint32Array(this.uniformArrayBuffer);
@@ -97,6 +114,12 @@ export class PickingLayer {
         const device = this.rendererWrapper.device;
         if (!device) return false;
         this.device = device;
+
+        if (!this.filterResources) {
+            this.filterResources = new FilterGpuResources(device, this.maxSlots);
+            this.ownsFilterResources = true;
+        }
+        this.filterResources.init();
 
         this.uniformBuffer = this.device.createBuffer({
             label: 'PickingLayer_SlotUniforms',
@@ -216,6 +239,7 @@ struct PickSlotUniforms {
 @group(0) @binding(6) var<storage, read> prevXBuf: array<f32>;
 @group(0) @binding(7) var<storage, read> prevYBuf: array<f32>;
 @group(0) @binding(8) var<storage, read_write> slotBestHit: array<atomic<u32>>;
+${buildSharedFilterWGSL(9, 10)}
 
 fn pcg_hash(v_in: u32) -> f32 {
     let state = v_in * 747796405u + 2891336453u;
@@ -333,6 +357,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let jitterY = (pcg_hash(i + 12345u) - 0.5) / 65535.0;
     let subX = rawX + jitterX;
     let subY = rawY + jitterY;
+    let globalX = u.tileOffsetX + subX * u.tileScale;
+    let globalY = u.tileOffsetY + subY * u.tileScale;
 
     var relWorldX = 0.0;
     if (isXSpatial) {
@@ -374,6 +400,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             u.rtcStepY,
             isYLiteral
         );
+    }
+
+    // Never pick filtered-out or dimmed context points (Step 3A parity with ComputeRasterizer)
+    if (filterU.header.x != 0u) {
+        var filtCVal = 0.0;
+        if (hasColorBuf) { filtCVal = colorBuf[i]; }
+        var filtSVal = 0.0;
+        if (hasSizeBuf) { filtSVal = sizeBuf[i]; }
+        var filtXVal = 0.0;
+        if (hasXBuf) { filtXVal = xBuf[i]; }
+        var filtYVal = 0.0;
+        if (hasYBuf) { filtYVal = yBuf[i]; }
+        if (!eval_filter_selected(
+            localIdx,
+            relWorldX,
+            fromTopY,
+            globalX,
+            globalY,
+            filtCVal, hasColorBuf,
+            filtSVal, hasSizeBuf,
+            filtXVal, hasXBuf,
+            filtYVal, hasYBuf
+        )) {
+            return;
+        }
     }
 
     if (isTransitioning) {
@@ -476,6 +527,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
                 { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
                 { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+                {
+                    binding: 9,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: 'uniform', minBindingSize: GLOBAL_FILTER_UNIFORM_BYTES },
+                },
+                {
+                    binding: 10,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: {
+                        type: 'uniform',
+                        hasDynamicOffset: true,
+                        minBindingSize: SLOT_MASK_SLICE_BYTES,
+                    },
+                },
             ],
         });
 
@@ -548,7 +613,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         xBuf: GPUBuffer,
         yBuf: GPUBuffer,
         prevXBuf: GPUBuffer,
-        prevYBuf: GPUBuffer
+        prevYBuf: GPUBuffer,
+        globalFilterBuf: GPUBuffer,
+        maskBuf: GPUBuffer
     ): GPUBindGroup {
         const cached = this.slotBindGroups[slot];
         if (
@@ -559,7 +626,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             cached.xBuf === xBuf &&
             cached.yBuf === yBuf &&
             cached.prevXBuf === prevXBuf &&
-            cached.prevYBuf === prevYBuf
+            cached.prevYBuf === prevYBuf &&
+            cached.globalFilterBuf === globalFilterBuf &&
+            cached.maskBuf === maskBuf
         ) {
             return cached.bindGroup;
         }
@@ -583,6 +652,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 { binding: 6, resource: { buffer: prevXBuf } },
                 { binding: 7, resource: { buffer: prevYBuf } },
                 { binding: 8, resource: { buffer: this.slotBestHitBuffer! } },
+                {
+                    binding: 9,
+                    resource: {
+                        buffer: globalFilterBuf,
+                        offset: 0,
+                        size: GLOBAL_FILTER_UNIFORM_BYTES,
+                    },
+                },
+                {
+                    binding: 10,
+                    resource: {
+                        buffer: maskBuf,
+                        offset: 0,
+                        size: SLOT_MASK_SLICE_BYTES,
+                    },
+                },
             ],
         });
 
@@ -595,6 +680,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             yBuf,
             prevXBuf,
             prevYBuf,
+            globalFilterBuf,
+            maskBuf,
         };
         return bindGroup;
     }
@@ -604,7 +691,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         cssY: number,
         camera: Camera2D,
         tileStore: TileGpuStore,
-        halfWindowCssPx = 4.5
+        halfWindowCssPx = 4.5,
+        projCtx?: AxisProjectionContext
     ): Promise<GpuPickWinner | null> {
         if (this.disposed) return null;
         if (this.activePickPromise) {
@@ -612,7 +700,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (this.disposed) return null;
         }
 
-        const runPromise = this.executePickPass(cssX, cssY, camera, tileStore, halfWindowCssPx);
+        const runPromise = this.executePickPass(
+            cssX,
+            cssY,
+            camera,
+            tileStore,
+            halfWindowCssPx,
+            projCtx
+        );
         this.activePickPromise = runPromise;
         try {
             return await runPromise;
@@ -628,7 +723,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         cssY: number,
         camera: Camera2D,
         tileStore: TileGpuStore,
-        halfWindowCssPx: number
+        halfWindowCssPx: number,
+        projCtx?: AxisProjectionContext
     ): Promise<GpuPickWinner | null> {
         if (!this.init()) return null;
         if (
@@ -636,7 +732,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             !this.dummyStorageBuffer ||
             !this.slotBestHitBuffer ||
             !this.readbackBuffer ||
-            !this.winnerCoordBuffer
+            !this.winnerCoordBuffer ||
+            !this.filterResources
         ) {
             return null;
         }
@@ -732,6 +829,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const maxMag = tileStore.maxMagCutoff;
         const dummy = this.dummyStorageBuffer;
         const limitSlots = Math.min(this.maxSlots, tileStore.maxSlots);
+        const xOrExtra1Field = isXSpatial
+            ? tileStore.auxField1 || tileStore.filterExtraField1
+            : xAxis.field;
+        const yOrExtra2Field = isYSpatial
+            ? tileStore.auxField2 || tileStore.filterExtraField2
+            : yAxis.field;
+
+        const resolvedProjCtx: AxisProjectionContext = projCtx ?? {
+            xAxis,
+            yAxis,
+            rootBounds: tileStore.rootBounds,
+            effectiveFlipY: false,
+            colOrigins: tileStore.colOrigins,
+        };
+        this.filterResources.updateFrameUniforms(camera, tileStore, resolvedProjCtx, [
+            colorSrc === 0 ? colorField : '',
+            sizeSrc === 0 ? sizeField : '',
+            xOrExtra1Field,
+            yOrExtra2Field,
+        ]);
+        const globalFilterBuf = this.filterResources.globalFilterBuffer!;
+        const activeMaskBuf = this.filterResources.getActiveMaskBuffer()!;
 
         // Determine maximum chunk count across visible slots (1 for all standard <= 262,144-row tiles)
         let maxChunks = 1;
@@ -760,7 +879,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         for (let chunkIdx = 0; chunkIdx < maxChunks; chunkIdx++) {
             const rowBaseOffset = chunkIdx * MAX_ROWS_PER_CHUNK;
-            const dispatches: { slot: number; bindGroup: GPUBindGroup; workgroups: number }[] = [];
+            const dispatches: {
+                slot: number;
+                maskByteOffset: number;
+                bindGroup: GPUBindGroup;
+                workgroups: number;
+            }[] = [];
             const dispatchedSnapshots = new Map<
                 number,
                 { key: string; xyBuf: GPUBuffer; activeRows: number }
@@ -836,11 +960,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 const sizeBuf =
                     (sizeSrc === 0 ? slotObj.buffers.get(sizeField) : undefined) || dummy;
                 const xBuf =
-                    (!isXSpatial && xAxis.field ? slotObj.buffers.get(xAxis.field) : undefined) ||
-                    dummy;
+                    (xOrExtra1Field ? slotObj.buffers.get(xOrExtra1Field) : undefined) || dummy;
                 const yBuf =
-                    (!isYSpatial && yAxis.field ? slotObj.buffers.get(yAxis.field) : undefined) ||
-                    dummy;
+                    (yOrExtra2Field ? slotObj.buffers.get(yOrExtra2Field) : undefined) || dummy;
                 const prevXBuf =
                     (isTransitioning && !prevIsXSpatial && prevCfg.x.field
                         ? slotObj.buffers.get(prevCfg.x.field)
@@ -954,10 +1076,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     xBuf,
                     yBuf,
                     prevXBuf,
-                    prevYBuf
+                    prevYBuf,
+                    globalFilterBuf,
+                    activeMaskBuf
                 );
                 dispatches.push({
                     slot: slotIdx,
+                    maskByteOffset: this.filterResources.getMaskDynamicOffset(slotIdx, chunkIdx),
                     bindGroup,
                     workgroups: Math.ceil(chunkRows / 256),
                 });
@@ -989,7 +1114,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             pass.setPipeline(this.pipeline);
             for (let i = 0; i < dispatches.length; i++) {
                 const item = dispatches[i];
-                pass.setBindGroup(0, item.bindGroup, [item.slot * SLOT_UNIFORM_STRIDE]);
+                pass.setBindGroup(0, item.bindGroup, [
+                    item.slot * SLOT_UNIFORM_STRIDE,
+                    item.maskByteOffset,
+                ]);
                 pass.dispatchWorkgroups(item.workgroups);
             }
             pass.end();
@@ -1182,7 +1310,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             (this.dummyStorageBuffer?.size ?? 0) +
             (this.slotBestHitBuffer?.size ?? 0) +
             (this.readbackBuffer?.size ?? 0) +
-            (this.winnerCoordBuffer?.size ?? 0)
+            (this.winnerCoordBuffer?.size ?? 0) +
+            (this.ownsFilterResources ? (this.filterResources?.getLiveGpuBytes() ?? 0) : 0)
         );
     }
 
@@ -1209,6 +1338,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             this.winnerCoordBuffer.destroy();
             this.winnerCoordBuffer = null;
         }
+        if (this.ownsFilterResources && this.filterResources) {
+            this.filterResources.dispose();
+        }
+        this.filterResources = null;
         for (let i = 0; i < this.slotBindGroups.length; i++) {
             this.slotBindGroups[i] = null;
         }

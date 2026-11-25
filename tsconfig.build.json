@@ -8,5 +8,5 @@
     "emitDeclarationOnly": true,
     "stripInternal": true
   },
-  "include": ["src/index.ts", "src/lib/types.ts"]
+  "include": ["src/index.ts", "src/lib/types.ts", "src/mosaic.ts"]
 }

@@ -47,6 +47,34 @@ export class Renderer {
     public onCanvasHover?: (cssX: number, cssY: number, event: PointerEvent) => void;
     public onCanvasPointerLeave?: () => void;
 
+    public interactionMode: 'pan' | 'brush' | 'lasso' = 'pan';
+    public shiftDragMode: 'brush' | 'lasso' | 'none' = 'brush';
+    public onSelectionDragStart?: (
+        mode: 'brush' | 'lasso',
+        cssX: number,
+        cssY: number,
+        event: PointerEvent
+    ) => boolean;
+    public onSelectionDragMove?: (
+        mode: 'brush' | 'lasso',
+        startCssX: number,
+        startCssY: number,
+        cssX: number,
+        cssY: number,
+        event: PointerEvent
+    ) => void;
+    /** Returns `true` when the gesture cleared/committed a brush so `onCanvasClick` should be suppressed. */
+    public onSelectionDragEnd?: (
+        mode: 'brush' | 'lasso',
+        startCssX: number,
+        startCssY: number,
+        cssX: number,
+        cssY: number,
+        totalTravelCssPx: number,
+        committed: boolean,
+        event: PointerEvent
+    ) => boolean;
+
     private container: HTMLElement;
     private powerPreference: GPUPowerPreference;
     private resizeObserver: ResizeObserver | null = null;
@@ -56,6 +84,9 @@ export class Renderer {
 
     private activePointerId: number | null = null;
     private activePointerButton = 0;
+    private activeSelectionGestureMode: 'brush' | 'lasso' | null = null;
+    private selectionStartCssX = 0;
+    private selectionStartCssY = 0;
     private pointerDownX = 0;
     private pointerDownY = 0;
     private maxPointerTravelPx = 0;
@@ -250,6 +281,13 @@ export class Renderer {
         }
     }
 
+    private resolveLeftGestureMode(event: PointerEvent): 'pan' | 'brush' | 'lasso' {
+        if (event.shiftKey && this.shiftDragMode !== 'none') {
+            return this.shiftDragMode;
+        }
+        return this.interactionMode;
+    }
+
     private onPointerDown(event: PointerEvent): void {
         if (this.disposed) return;
         if (event.button !== 0 && event.button !== 1 && event.button !== 2) return;
@@ -262,6 +300,24 @@ export class Renderer {
         this.maxPointerTravelPx = 0;
         this.lastPointerX = event.clientX;
         this.lastPointerY = event.clientY;
+        this.activeSelectionGestureMode = null;
+
+        if (event.button === 0) {
+            const mode = this.resolveLeftGestureMode(event);
+            if (mode === 'brush' || mode === 'lasso') {
+                const rect = this.canvas.getBoundingClientRect();
+                const cssX = event.clientX - rect.left;
+                const cssY = event.clientY - rect.top;
+                this.selectionStartCssX = cssX;
+                this.selectionStartCssY = cssY;
+                const captured =
+                    this.onSelectionDragStart?.(mode, cssX, cssY, event) ?? true;
+                if (captured) {
+                    this.activeSelectionGestureMode = mode;
+                }
+            }
+        }
+
         try {
             this.canvas.setPointerCapture(event.pointerId);
         } catch {
@@ -301,6 +357,20 @@ export class Renderer {
         if (dxPx === 0 && dyPx === 0) return;
 
         const rect = this.canvas.getBoundingClientRect();
+        if (this.activeSelectionGestureMode) {
+            const cssX = event.clientX - rect.left;
+            const cssY = event.clientY - rect.top;
+            this.onSelectionDragMove?.(
+                this.activeSelectionGestureMode,
+                this.selectionStartCssX,
+                this.selectionStartCssY,
+                cssX,
+                cssY,
+                event
+            );
+            return;
+        }
+
         const rw = Math.max(1, rect.width);
         const rh = Math.max(1, rect.height);
 
@@ -314,6 +384,8 @@ export class Renderer {
     private onPointerUp(event: PointerEvent, allowClick: boolean): void {
         if (this.activePointerId !== event.pointerId) return;
         const wasLeftButton = this.activePointerButton === 0;
+        const gestureMode = this.activeSelectionGestureMode;
+        this.activeSelectionGestureMode = null;
         const finalTravel = Math.max(
             this.maxPointerTravelPx,
             Math.hypot(event.clientX - this.pointerDownX, event.clientY - this.pointerDownY)
@@ -333,7 +405,23 @@ export class Renderer {
         const cssY = event.clientY - rect.top;
         const isInside = cssX >= 0 && cssY >= 0 && cssX <= rect.width && cssY <= rect.height;
 
+        let suppressClick = false;
+        if (gestureMode) {
+            suppressClick =
+                this.onSelectionDragEnd?.(
+                    gestureMode,
+                    this.selectionStartCssX,
+                    this.selectionStartCssY,
+                    cssX,
+                    cssY,
+                    finalTravel,
+                    allowClick,
+                    event
+                ) ?? false;
+        }
+
         if (
+            !suppressClick &&
             allowClick &&
             wasLeftButton &&
             finalTravel < CLICK_MAX_TRAVEL_CSS_PX &&

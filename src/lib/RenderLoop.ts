@@ -1,17 +1,28 @@
-import type { Renderer } from '../core/Renderer.ts';
 import type { ComputeRasterizer } from '../core/ComputeRasterizer.ts';
-import type { HighlightOverlay } from '../core/HighlightOverlay.ts';
+import type { EdgeOverlay } from '../core/EdgeOverlay.ts';
+import type { AxisProjectionContext } from '../core/FilterGpuResources.ts';
+import type { HighlightMarkerSpec, HighlightOverlay } from '../core/HighlightOverlay.ts';
+import type { Renderer } from '../core/Renderer.ts';
+import type { SelectionOverlay } from '../core/SelectionOverlay.ts';
 import type { TileGpuStore } from '../core/TileGpuStore.ts';
 import type { BoundingBox, TileData } from '../PMTilesClient.ts';
 import type { DatasetSession } from './DatasetSession.ts';
+import type { DeepgraphFilter, TelemetrySnapshot } from './types.ts';
 import type { ViewState } from './ViewState.ts';
-import type { TelemetrySnapshot } from './types.ts';
 
 export class RenderLoop {
     private rendererWrapper: Renderer;
     private tileStore: TileGpuStore;
     private computeRasterizer: ComputeRasterizer;
+    private edgeOverlay: EdgeOverlay;
+    private selectionOverlay: SelectionOverlay;
     private highlightOverlay: HighlightOverlay;
+    private getActiveFilter: () => DeepgraphFilter | null;
+    private isMarkerVisible: (marker: HighlightMarkerSpec) => boolean;
+    private getProjectionContexts: (session: DatasetSession) => {
+        current: AxisProjectionContext;
+        previous: AxisProjectionContext | null;
+    };
     private getExtraGpuBytes: () => number;
     private viewState: ViewState;
     private getSession: () => DatasetSession | null;
@@ -20,6 +31,7 @@ export class RenderLoop {
 
     private activeVisibleTiles: TileData[] = [];
     private hasPendingUpdates = false;
+    private overlayDirty = false;
     private lastCamHash = '';
     private currentZDisplay = 0;
     private lastFrameTime = performance.now();
@@ -39,7 +51,15 @@ export class RenderLoop {
         rendererWrapper: Renderer;
         tileStore: TileGpuStore;
         computeRasterizer: ComputeRasterizer;
+        edgeOverlay: EdgeOverlay;
+        selectionOverlay: SelectionOverlay;
         highlightOverlay: HighlightOverlay;
+        getActiveFilter: () => DeepgraphFilter | null;
+        isMarkerVisible: (marker: HighlightMarkerSpec) => boolean;
+        getProjectionContexts: (session: DatasetSession) => {
+            current: AxisProjectionContext;
+            previous: AxisProjectionContext | null;
+        };
         getExtraGpuBytes: () => number;
         viewState: ViewState;
         getSession: () => DatasetSession | null;
@@ -49,12 +69,21 @@ export class RenderLoop {
         this.rendererWrapper = params.rendererWrapper;
         this.tileStore = params.tileStore;
         this.computeRasterizer = params.computeRasterizer;
+        this.edgeOverlay = params.edgeOverlay;
+        this.selectionOverlay = params.selectionOverlay;
         this.highlightOverlay = params.highlightOverlay;
+        this.getActiveFilter = params.getActiveFilter;
+        this.isMarkerVisible = params.isMarkerVisible;
+        this.getProjectionContexts = params.getProjectionContexts;
         this.getExtraGpuBytes = params.getExtraGpuBytes;
         this.viewState = params.viewState;
         this.getSession = params.getSession;
         this.onTelemetry = params.onTelemetry;
         this.onError = params.onError;
+    }
+
+    public markDirty(): void {
+        this.overlayDirty = true;
     }
 
     public syncEpoch(epochKyr: number): void {
@@ -65,6 +94,7 @@ export class RenderLoop {
         this.lastCamHash = '';
         this.activeVisibleTiles = [];
         this.hasPendingUpdates = false;
+        this.overlayDirty = true;
         this.currentZDisplay = 0;
     }
 
@@ -81,6 +111,7 @@ export class RenderLoop {
                 const t0 = performance.now();
                 const dtSec = Math.min(0.1, Math.max(0.0, (t0 - this.lastFrameTime) * 0.001));
                 this.lastFrameTime = t0;
+                this.overlayDirty = false;
 
                 if (this.viewState.isFlowAnimated && this.tileStore.computeMode === 3) {
                     this.animatedEpochKyr = this.viewState.advanceFlowEpoch(
@@ -142,12 +173,43 @@ export class RenderLoop {
                     t2,
                     this.rendererWrapper.baseZoom
                 );
+                const projContexts = this.getProjectionContexts(session);
+                const activeFilter = this.getActiveFilter();
                 const t3 = performance.now();
 
-                // Compute-Only (`D9`): all modes + 2s WGSL axis transitions + plain-WebGPU highlight overlay
-                this.computeRasterizer.render(cam, this.tileStore, (encoder, targetView) => {
-                    this.highlightOverlay.encodePass(encoder, targetView, cam, this.tileStore);
-                });
+                // Render order (`Step 3A`):
+                // ComputeRasterizer -> EdgeOverlay -> SelectionOverlay -> HighlightOverlay (rings on top)
+                this.computeRasterizer.render(
+                    cam,
+                    this.tileStore,
+                    (encoder, targetView) => {
+                        this.edgeOverlay.encodePass(
+                            encoder,
+                            targetView,
+                            cam,
+                            this.tileStore,
+                            projContexts.current,
+                            projContexts.previous
+                        );
+                        this.selectionOverlay.encodePass(
+                            encoder,
+                            targetView,
+                            cam,
+                            projContexts.current,
+                            activeFilter?.rect,
+                            activeFilter?.lasso,
+                            this.tileStore.lightBackground
+                        );
+                        this.highlightOverlay.encodePass(
+                            encoder,
+                            targetView,
+                            cam,
+                            this.tileStore,
+                            this.isMarkerVisible
+                        );
+                    },
+                    projContexts.current
+                );
 
                 const t4 = performance.now();
 
@@ -243,9 +305,6 @@ export class RenderLoop {
 
         this.rendererWrapper.setAnimationLoop(tickFrame);
 
-        // Occluded-window progression guard: if OS window occlusion pauses `requestAnimationFrame`
-        // while tiles are decoding, uploading, camera-panning, transitioning, or completing their
-        // 300ms spawn fade, drain pending GPU uploads & settle the frame cleanly without spinning once idle.
         this.occlusionTimer = setInterval(() => {
             const now = performance.now();
             if (now - this.lastFrameTime < 24) return;
@@ -268,11 +327,12 @@ export class RenderLoop {
                 camMoved ||
                 session.cacheChanged ||
                 this.hasPendingUpdates ||
+                this.overlayDirty ||
+                this.edgeOverlay.isPulseAnimated ||
                 this.tileStore.isTransitioning ||
                 anyFading
             ) {
                 tickFrame();
-                // Drain any remaining >8ms upload batch while occluded so CPU column buffers release immediately
                 let guard = 0;
                 while (this.hasPendingUpdates && guard++ < 8) {
                     this.hasPendingUpdates = this.tileStore.updateVisibleTiles(
