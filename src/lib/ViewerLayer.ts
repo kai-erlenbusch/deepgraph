@@ -114,6 +114,7 @@ export class ViewerLayer implements DeepgraphPlot {
     private resolveEdges?: EgoEdgeResolver;
     private resolveEdgesOnHover: boolean;
     private enableRowIdIndex: boolean;
+    private maxSelectedRowIds?: number;
     private evictedSelectedMarkerAllowed = new Map<bigint, boolean>();
     private rowIdFilterSeq = 0;
 
@@ -180,6 +181,7 @@ export class ViewerLayer implements DeepgraphPlot {
         this.resolveEdges = options.resolveEdges;
         this.resolveEdgesOnHover = options.resolveEdgesOnHover ?? true;
         this.enableRowIdIndex = Boolean(options.enableRowIdIndex);
+        this.maxSelectedRowIds = options.maxSelectedRowIds;
         this.viewState = new ViewState(options.detailOffset ?? 2);
 
         this.rendererWrapper.interactionMode = options.interactionMode ?? 'pan';
@@ -304,7 +306,12 @@ export class ViewerLayer implements DeepgraphPlot {
             container,
             options.powerPreference ?? 'high-performance'
         );
-        await rendererWrapper.init();
+        try {
+            await rendererWrapper.init();
+        } catch (err) {
+            rendererWrapper.dispose();
+            throw err;
+        }
 
         const device = rendererWrapper.device;
         if (!device) {
@@ -784,15 +791,23 @@ export class ViewerLayer implements DeepgraphPlot {
         this.edgeOverlay.clearEgoEdges();
         this.emit('brush', clause);
 
-        if (this.enableRowIdIndex && this.viewState.isSpatialX && this.viewState.isSpatialY) {
+        if (
+            this.enableRowIdIndex &&
+            this.maxSelectedRowIds !== 0 &&
+            this.viewState.isSpatialX &&
+            this.viewState.isSpatialY
+        ) {
             const gen = this.loadGeneration;
             const sess = this.session;
             void sess
-                .queryLoadedSpatialSelection({
-                    rect: clause.rect ?? null,
-                    lasso: clause.lasso?.points ?? null,
-                    effectiveFlipY: this.viewState.effectiveFlipY,
-                })
+                .queryLoadedSpatialSelection(
+                    {
+                        rect: clause.rect ?? null,
+                        lasso: clause.lasso?.points ?? null,
+                        effectiveFlipY: this.viewState.effectiveFlipY,
+                    },
+                    this.maxSelectedRowIds
+                )
                 .then((res) => {
                     if (this.destroyed || gen !== this.loadGeneration) return;
                     this.emit('select', {
@@ -800,6 +815,8 @@ export class ViewerLayer implements DeepgraphPlot {
                         clause,
                         rowIds: res.rowIds,
                         rowIdsBigInt: res.rowIdsBigInt,
+                        totalMatched: res.totalMatched,
+                        rowIdsTruncated: res.truncated,
                     });
                 })
                 .catch(() => {
@@ -808,7 +825,11 @@ export class ViewerLayer implements DeepgraphPlot {
                     }
                 });
         } else {
-            this.emit('select', { points: [], clause });
+            this.emit('select', {
+                points: [],
+                clause,
+                ...(this.maxSelectedRowIds === 0 ? { rowIdsTruncated: true } : {}),
+            });
         }
 
         return true;
@@ -1072,7 +1093,15 @@ export class ViewerLayer implements DeepgraphPlot {
                 return null;
             }
             if (enriched && typeof enriched === 'object') {
-                finalAttrs = { ...decoded.attributes, ...enriched };
+                // Preserve `enriched` key order first (so cold sidecar summaries/prompts lead inspect UIs)
+                // while retaining any `decoded.attributes` columns omitted by partial resolvers.
+                const nextAttrs: Record<string, unknown> = { ...enriched };
+                for (const [k, v] of Object.entries(decoded.attributes)) {
+                    if (!(k in nextAttrs)) {
+                        nextAttrs[k] = v;
+                    }
+                }
+                finalAttrs = nextAttrs;
             }
         }
 
@@ -1476,23 +1505,45 @@ export class ViewerLayer implements DeepgraphPlot {
         this.renderLoop.markDirty();
     }
 
-    public async getSelectedRowIds(): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }> {
-        if (!this.session || this.destroyed) return { rowIds: [], rowIdsBigInt: [] };
+    public async getSelectedRowIds(maxCount?: number): Promise<{
+        rowIds: number[];
+        rowIdsBigInt: bigint[];
+        totalMatched: number;
+        truncated: boolean;
+    }> {
+        if (!this.session || this.destroyed) {
+            return { rowIds: [], rowIdsBigInt: [], totalMatched: 0, truncated: false };
+        }
+        const effCap = maxCount !== undefined ? maxCount : this.maxSelectedRowIds;
         const f = this.filterResources.currentFilter;
         if (f && (f.rect || f.lasso) && this.viewState.isSpatialX && this.viewState.isSpatialY) {
             this.enableRowIdIndex = true;
-            return this.session.queryLoadedSpatialSelection({
-                rect: f.rect ?? null,
-                lasso: f.lasso?.points ?? null,
-                effectiveFlipY: this.viewState.effectiveFlipY,
-            });
+            return this.session.queryLoadedSpatialSelection(
+                {
+                    rect: f.rect ?? null,
+                    lasso: f.lasso?.points ?? null,
+                    effectiveFlipY: this.viewState.effectiveFlipY,
+                },
+                effCap
+            );
         }
         const pts = this.highlightOverlay.selectedMarkers;
-        const rowIds = pts.map((m) => m.rowId);
-        const rowIdsBigInt = pts.map((m) =>
+        const totalMatched = pts.length;
+        const sliceLen =
+            effCap !== undefined && Number.isFinite(effCap) && effCap >= 0
+                ? Math.min(pts.length, Math.trunc(effCap))
+                : pts.length;
+        const sliced = pts.slice(0, sliceLen);
+        const rowIds = sliced.map((m) => m.rowId);
+        const rowIdsBigInt = sliced.map((m) =>
             m.rowIdBigInt !== undefined ? m.rowIdBigInt : BigInt(Math.trunc(m.rowId))
         );
-        return { rowIds, rowIdsBigInt };
+        return {
+            rowIds,
+            rowIdsBigInt,
+            totalMatched,
+            truncated: totalMatched > sliceLen,
+        };
     }
 
     public setEdges(edges: ReadonlyArray<EdgeSpec>, style?: EdgeStyleOptions): void {

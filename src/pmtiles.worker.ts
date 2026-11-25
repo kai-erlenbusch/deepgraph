@@ -171,8 +171,13 @@ if (isWorkerScope) {
 
         if (data.action === 'query_loaded_selection') {
             try {
+                const maxIds =
+                    typeof data.maxIds === 'number' && Number.isFinite(data.maxIds) && data.maxIds >= 0
+                        ? Math.trunc(data.maxIds)
+                        : Infinity;
                 const chunks: BigUint64Array[] = [];
-                let totalLen = 0;
+                let totalMatched = 0;
+                let bufferedLen = 0;
                 for (const [tileKey, idxEntry] of cachedTileRowIndex.entries()) {
                     if (Array.isArray(data.visibleKeys) && !data.visibleKeys.includes(tileKey)) {
                         continue;
@@ -186,11 +191,15 @@ if (isWorkerScope) {
                         activeFilterU64
                     );
                     if (matched.length > 0) {
-                        chunks.push(matched);
-                        totalLen += matched.length;
+                        totalMatched += matched.length;
+                        if (bufferedLen < maxIds) {
+                            const take = Math.min(matched.length, maxIds - bufferedLen);
+                            chunks.push(take === matched.length ? matched : matched.subarray(0, take));
+                            bufferedLen += take;
+                        }
                     }
                 }
-                const combined = new BigUint64Array(totalLen);
+                const combined = new BigUint64Array(bufferedLen);
                 let dst = 0;
                 for (const c of chunks) {
                     combined.set(c, dst);
@@ -202,6 +211,7 @@ if (isWorkerScope) {
                         id: data.id,
                         action: 'query_loaded_selection',
                         idsBuffer: outBuf,
+                        totalMatched,
                     },
                     { transfer: [outBuf] } as any
                 );

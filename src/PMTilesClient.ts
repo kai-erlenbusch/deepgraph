@@ -188,6 +188,7 @@ export class PMTilesClient {
     >();
     private retainRowIds = false;
     private hasActiveRowIdFilter = false;
+    private retainedFilterBufferBytes = 0;
     private indexedTileKeys = new Set<string>();
     private tileRowIndexBytes = new Map<string, number>();
     private rawPickTileCache = new Map<string, { slices: (ArrayBuffer | null)[]; byteLength: number }>();
@@ -480,53 +481,61 @@ export class PMTilesClient {
         }
         if (missingKeys.length === 0) return;
 
+        const concurrency = Math.max(1, Math.min(6, missingKeys.length));
+        let cursor = 0;
         await Promise.all(
-            missingKeys.map(async (key) => {
-                if (this.destroyed || !this.activeTiles.has(key)) return;
-                const [zStr, xStr, yStr] = key.split('/');
-                const z = parseInt(zStr, 10);
-                const x = parseInt(xStr, 10);
-                const y = parseInt(yStr, 10);
-                const rawSlices = await this.fetchOrGetRawPickTile(z, x, y, key);
-                if (!rawSlices || this.destroyed || !this.activeTiles.has(key)) return;
+            Array.from({ length: concurrency }, async () => {
+                while (cursor < missingKeys.length && !this.destroyed) {
+                    const key = missingKeys[cursor++];
+                    if (!this.activeTiles.has(key)) continue;
+                    const [zStr, xStr, yStr] = key.split('/');
+                    const z = parseInt(zStr, 10);
+                    const x = parseInt(xStr, 10);
+                    const y = parseInt(yStr, 10);
+                    const rawSlices = await this.fetchOrGetRawPickTile(z, x, y, key);
+                    if (!rawSlices || this.destroyed || !this.activeTiles.has(key)) continue;
 
-                const transfers: ArrayBuffer[] = [];
-                const copies = rawSlices.map((s) => {
-                    if (!s || s.byteLength === 0) return null;
-                    const c = s.slice(0);
-                    transfers.push(c);
-                    return c;
-                });
-
-                await new Promise<void>((resolve, reject) => {
-                    if (this.destroyed) {
-                        resolve();
-                        return;
-                    }
-                    const id = `idx_${++this.nextReqId}`;
-                    this.workerRpcResolvers.set(id, {
-                        resolve: (res) => {
-                            if (this.activeTiles.has(key)) {
-                                this.indexedTileKeys.add(key);
-                                if (typeof res.rowIndexBytes === 'number' && res.rowIndexBytes > 0) {
-                                    this.tileRowIndexBytes.set(key, res.rowIndexBytes);
-                                }
-                                if (Array.isArray(res.slices) && res.slices.length > 0) {
-                                    const t = this.activeTiles.get(key);
-                                    if (t) t.rowMaskSlices = res.slices;
-                                }
-                            } else {
-                                this.notifyWorkersDropTile(key);
-                            }
-                            resolve();
-                        },
-                        reject,
+                    const transfers: ArrayBuffer[] = [];
+                    const copies = rawSlices.map((s) => {
+                        if (!s || s.byteLength === 0) return null;
+                        const c = s.slice(0);
+                        transfers.push(c);
+                        return c;
                     });
-                    this.dispatchToWorker(
-                        { action: 'index_tile_rowids', id, key, buffers: copies },
-                        transfers
-                    );
-                });
+
+                    await new Promise<void>((resolve, reject) => {
+                        if (this.destroyed) {
+                            resolve();
+                            return;
+                        }
+                        const id = `idx_${++this.nextReqId}`;
+                        this.workerRpcResolvers.set(id, {
+                            resolve: (res) => {
+                                if (this.activeTiles.has(key)) {
+                                    this.indexedTileKeys.add(key);
+                                    if (
+                                        typeof res.rowIndexBytes === 'number' &&
+                                        res.rowIndexBytes > 0
+                                    ) {
+                                        this.tileRowIndexBytes.set(key, res.rowIndexBytes);
+                                    }
+                                    if (Array.isArray(res.slices) && res.slices.length > 0) {
+                                        const t = this.activeTiles.get(key);
+                                        if (t) t.rowMaskSlices = res.slices;
+                                    }
+                                } else {
+                                    this.notifyWorkersDropTile(key);
+                                }
+                                resolve();
+                            },
+                            reject,
+                        });
+                        this.dispatchToWorker(
+                            { action: 'index_tile_rowids', id, key, buffers: copies },
+                            transfers
+                        );
+                    });
+                }
             })
         );
     }
@@ -544,6 +553,7 @@ export class PMTilesClient {
 
         if (ids === null) {
             this.hasActiveRowIdFilter = false;
+            this.retainedFilterBufferBytes = 0;
             for (const tile of this.activeTiles.values()) {
                 delete tile.rowMaskSlices;
             }
@@ -623,6 +633,8 @@ export class PMTilesClient {
         }
 
         this.hasActiveRowIdFilter = true;
+        const singleFilterBytes = rawU32?.byteLength ?? rawU64?.byteLength ?? 0;
+        this.retainedFilterBufferBytes = singleFilterBytes * this.allWorkers.length;
         this.setRetainRowIds(true);
         await this.ensureResidentTilesIndexed();
         if (this.destroyed) return { masks: result, probeMatches: null };
@@ -683,47 +695,102 @@ export class PMTilesClient {
 
     /** Queries loaded visible tiles in workers for `row_id`s matching a spatial `rect` or `lasso`. */
     public async queryLoadedSpatialSelection(
-        spec: WorkerSpatialQuerySpec
-    ): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }> {
-        if (this.destroyed) return { rowIds: [], rowIdsBigInt: [] };
+        spec: WorkerSpatialQuerySpec,
+        maxCount?: number
+    ): Promise<{
+        rowIds: number[];
+        rowIdsBigInt: bigint[];
+        totalMatched: number;
+        truncated: boolean;
+    }> {
+        if (this.destroyed) {
+            return { rowIds: [], rowIdsBigInt: [], totalMatched: 0, truncated: false };
+        }
+        const cap =
+            maxCount !== undefined && Number.isFinite(maxCount) && maxCount >= 0
+                ? Math.trunc(maxCount)
+                : Infinity;
+        if (cap === 0) {
+            return { rowIds: [], rowIdsBigInt: [], totalMatched: 0, truncated: true };
+        }
+
         this.setRetainRowIds(true);
         await this.ensureResidentTilesIndexed();
-        if (this.destroyed) return { rowIds: [], rowIdsBigInt: [] };
+        if (this.destroyed) {
+            return { rowIds: [], rowIdsBigInt: [], totalMatched: 0, truncated: false };
+        }
 
         const visibleKeys = Array.from(this.currentlyVisibleIds);
-        const buffers = await Promise.all(
+        const results = await Promise.all(
             this.allWorkers.map(
                 (worker) =>
-                    new Promise<ArrayBuffer>((resolve, reject) => {
-                        const id = `selq_${++this.nextReqId}`;
-                        this.workerRpcResolvers.set(id, {
-                            resolve: (res) => resolve(res.idsBuffer as ArrayBuffer),
-                            reject,
-                        });
-                        worker.postMessage({
-                            action: 'query_loaded_selection',
-                            id,
-                            visibleKeys,
-                            spec,
-                        });
-                    })
+                    new Promise<{ idsBuffer: ArrayBuffer; totalMatched: number }>(
+                        (resolve, reject) => {
+                            const id = `selq_${++this.nextReqId}`;
+                            this.workerRpcResolvers.set(id, {
+                                resolve: (res) =>
+                                    resolve({
+                                        idsBuffer: res.idsBuffer as ArrayBuffer,
+                                        totalMatched: Number(res.totalMatched ?? 0),
+                                    }),
+                                reject,
+                            });
+                            worker.postMessage({
+                                action: 'query_loaded_selection',
+                                id,
+                                visibleKeys,
+                                spec,
+                                ...(Number.isFinite(cap) ? { maxIds: cap } : {}),
+                            });
+                        }
+                    )
             )
         );
 
-        const seen = new Set<bigint>();
-        const rowIds: number[] = [];
-        const rowIdsBigInt: bigint[] = [];
-        for (const buf of buffers) {
-            const arr = new BigUint64Array(buf);
-            for (let i = 0; i < arr.length; i++) {
-                const v = arr[i];
-                if (seen.has(v)) continue;
-                seen.add(v);
-                rowIdsBigInt.push(v);
-                rowIds.push(Number(v));
+        let totalMatched = 0;
+        let combinedLen = 0;
+        for (const r of results) {
+            totalMatched += r.totalMatched;
+            combinedLen += Math.floor(r.idsBuffer.byteLength / 8);
+        }
+        if (combinedLen === 0) {
+            return { rowIds: [], rowIdsBigInt: [], totalMatched: 0, truncated: false };
+        }
+
+        // Contiguous typed-array sort + adjacent dedup (`0` boxed `Set<bigint>` heap nodes!)
+        const merged = new BigUint64Array(combinedLen);
+        let offset = 0;
+        for (const r of results) {
+            const view = new BigUint64Array(r.idsBuffer);
+            merged.set(view, offset);
+            offset += view.length;
+        }
+        merged.sort();
+
+        let uniqueTotal = 0;
+        for (let i = 0; i < merged.length; i++) {
+            if (i === 0 || merged[i] !== merged[i - 1]) {
+                uniqueTotal++;
             }
         }
-        return { rowIds, rowIdsBigInt };
+        const reportedTotal = Math.max(uniqueTotal, totalMatched);
+        const outLen = Math.min(uniqueTotal, cap);
+        const rowIds = new Array<number>(outLen);
+        const rowIdsBigInt = new Array<bigint>(outLen);
+        let outIdx = 0;
+        for (let i = 0; i < merged.length && outIdx < outLen; i++) {
+            const v = merged[i];
+            if (i > 0 && v === merged[i - 1]) continue;
+            rowIdsBigInt[outIdx] = v;
+            rowIds[outIdx] = Number(v);
+            outIdx++;
+        }
+        return {
+            rowIds,
+            rowIdsBigInt,
+            totalMatched: reportedTotal,
+            truncated: reportedTotal > outLen,
+        };
     }
 
     public setRootBounds(rootBounds: BoundingBox): void {
@@ -827,7 +894,8 @@ export class PMTilesClient {
                 pooledColumnBytes +
                 pooledRawPayloadBytes +
                 this.rawPickTileCacheBytes +
-                workerRowIndexBytes,
+                workerRowIndexBytes +
+                this.retainedFilterBufferBytes,
         };
     }
 
@@ -1342,6 +1410,11 @@ export class PMTilesClient {
                 if (typeof data.rowIndexBytes === 'number' && data.rowIndexBytes > 0) {
                     this.indexedTileKeys.add(data.key);
                     this.tileRowIndexBytes.set(data.key, data.rowIndexBytes);
+                    for (const w of this.allWorkers) {
+                        if (w !== worker) {
+                            w.postMessage({ action: 'drop_tile', key: data.key });
+                        }
+                    }
                 }
                 const tileData: TileData = {
                     key: data.key,
@@ -1409,8 +1482,9 @@ export class PMTilesClient {
                     this.fetchTelemetry.p95 > this.fetchTelemetry.sloBudgetMs;
             }
         } else {
-            // Request was aborted before worker responded — recycle within tight cap
+            // Request was aborted before worker responded — drop any cached row index on that worker
             if (typeof data.key === 'string') {
+                worker.postMessage({ action: 'drop_tile', key: data.key });
                 this.notifyWorkersDropTile(data.key);
             }
             this.recycleColumnMap(data.columns);

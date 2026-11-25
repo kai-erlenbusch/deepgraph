@@ -4,7 +4,7 @@
 
 **Deepgraph** is an embeddable, pure-WebGPU billion-point and graph visualization engine for streaming out-of-core **`.arrowtiles` (`v0.1`)** spatial pyramids over HTTP Range requests, local `File` handles, or custom `CustomRangeSource` transports.
 
-Built directly on plain WebGPU compute shaders (`0` Three.js / WebGL dependencies, `0 B` main-thread Arrow parser weight, `~51.0 kB` gzipped bundler entry), Deepgraph renders multi-million to billion-row datasets—verified end-to-end on **`1,348,176,623` ESA Gaia DR3 stars** (`31.81 GiB` archive; `~0.69–0.73s` cold TTFF over `50 ms / 50 Mbps` WAN, `174.8–178.9 FPS` up to `7.22M` active stars on RTX 5090 / `67.4–179.6 FPS` on Intel `xe-lpg` iGPU) and **`2,835,490` LMSys UMAP chat embeddings**—with `0.0000%` stationary shimmer, instant GPU hover/click picking, smooth 2-second WGSL axis transitions, and deterministic GPU memory teardown.
+Built directly on plain WebGPU compute shaders (`0` Three.js / WebGL dependencies, `0 B` main-thread Arrow parser weight, `~72.8 kB` gzipped bundler entry), Deepgraph renders multi-million to billion-row datasets—verified end-to-end on **`1,348,176,623` ESA Gaia DR3 stars** (`31.81 GiB` archive; `~0.69–0.73s` cold TTFF over `50 ms / 50 Mbps` WAN, `174.8–178.9 FPS` up to `7.22M` active stars on RTX 5090 / `67.4–179.6 FPS` on Intel `xe-lpg` iGPU) and **`2,835,490` LMSys UMAP chat embeddings**—with `0.0000%` stationary shimmer, instant GPU hover/click picking, smooth 2-second WGSL axis transitions, and deterministic GPU memory teardown.
 
 The companion Python + Rust builder, reader, validator, and [`1.35B` hardware crucible benchmark](https://github.com/kai-erlenbusch/arrowtiles/blob/main/docs/BENCHMARK_v011_crucible.md) live in the sibling **[arrowtiles](https://github.com/kai-erlenbusch/arrowtiles)** repository (`pip install arrowtiles`).
 
@@ -38,14 +38,42 @@ plot.on('click', (hit) => {
 });
 ```
 
-For zero-build `<script type="module">` HTML pages, import `deepgraph/standalone` (see [`examples/embed.html`](examples/embed.html) and full reference in [`docs/API.md`](docs/API.md)).
+For zero-build `<script type="module">` HTML pages, import `deepgraph/standalone` (see [`examples/embed.html`](examples/embed.html)). For linked DuckDB / Mosaic cross-filtering, import `deepgraph/mosaic` (full reference in [`docs/API.md`](docs/API.md)).
+
+### Python (`pydeepgraph`) for Marimo & Jupyter
+
+```bash
+pip install pydeepgraph
+```
+
+```python
+import marimo as mo
+import pydeepgraph as dg
+
+scatter = mo.ui.anywidget(
+    dg.plot(
+        "embeddings.arrowtiles",
+        x="x",
+        y="y",
+        color="model",
+        sidecar="conversations.parquet",
+        edges="knn_edges.parquet",
+    )
+)
+```
+
+Launch the reactive Marimo DuckDB 10-NN ego-graph showcase locally:
+
+```bash
+marimo run python/examples/marimo_lmsys_mosaic.py
+```
 
 ---
 
 ## Local Development & Demo App
 
 ### Prerequisites
-- Node.js 20+
+- Node.js 22.6+ (Node.js 20+ for library/demo builds; Node.js 22.6+ for `npm run test:unit` native TypeScript stripping)
 - A WebGPU-capable browser (Chrome 113+, Edge 113+, Safari 18+, or Firefox Nightly)
 
 ```bash
@@ -111,7 +139,7 @@ flowchart LR
 ## Sibling & Ecosystem Projects
 
 - **[arrowtiles](https://github.com/kai-erlenbusch/arrowtiles)** (`pip install arrowtiles`): DuckDB + Rust (`PyO3`) `.arrowtiles` `v0.1` spatial pyramid builder, reader, validator, and format specification (`docs/SPEC.md`).
-- **Python / Jupyter Integration (Planned):** `pydeepgraph` (`pip install pydeepgraph`).
+- **Python / Marimo & Jupyter Widget ([`python/`](python/)):** `pydeepgraph` (`pip install pydeepgraph`) — zero-copy `mmap` HTTP `206` / `<= 512 KiB` `CommRangeSource` `anywidget` with DuckDB cold sidecar enrichment, SQL `row_id` bitmasks, and 1-hop kNN ego-network arcs.
 
 ---
 

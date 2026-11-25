@@ -180,8 +180,8 @@ export interface SizeChannelEncoding {
 export interface DeepgraphEncoding {
     x?: string | null | AxisChannelEncoding;
     y?: string | null | AxisChannelEncoding;
-    color?: string | ColorChannelEncoding;
-    size?: string | SizeChannelEncoding;
+    color?: string | null | ColorChannelEncoding;
+    size?: string | null | SizeChannelEncoding;
     flipY?: boolean;
     aggregation?: AggregationStrategy;
     lightBackground?: boolean;
@@ -370,6 +370,10 @@ export interface PointSelectEvent {
     /** Loaded-tile `row_id`s matching a committed brush/lasso when `enableRowIdIndex` is active. */
     rowIds?: number[];
     rowIdsBigInt?: bigint[];
+    /** Total matched rows across loaded visible tiles prior to any `maxSelectedRowIds` cap. */
+    totalMatched?: number;
+    /** `true` when `rowIds` was capped by `maxSelectedRowIds`. */
+    rowIdsTruncated?: boolean;
 }
 
 /** Optional sidecar hook (`D8(2)`) to enrich picked `rowId`s with cold/dropped columns (e.g. from Parquet). */
@@ -399,10 +403,12 @@ export interface DeepgraphOptions {
     shiftDragMode?: 'brush' | 'lasso' | 'none';
     /** Retain compact per-tile `row_id` arrays in workers for `setFilteredRowIds` / `getSelectedRowIds` (`false` default; auto-enabled on demand). */
     enableRowIdIndex?: boolean;
+    /** Optional cap on `rowIds` / `rowIdsBigInt` materialized per committed brush/lasso (`undefined` = unlimited; `0` skips loaded-tile `row_id` extraction). */
+    maxSelectedRowIds?: number;
     /** Initial declarative GPU cross-filter. */
-    filter?: DeepgraphFilter;
+    filter?: DeepgraphFilter | null;
     /** Initial static curved graph/kNN edges (`EdgeOverlay`). */
-    edges?: EdgeSpec[];
+    edges?: ReadonlyArray<EdgeSpec>;
     /** Initial visual styling for `EdgeOverlay` arcs. */
     edgeStyle?: EdgeStyleOptions;
     /** Optional async/sync resolver for 1-hop ego-network / kNN arcs on hover or click. */
@@ -475,7 +481,12 @@ export interface DeepgraphPlot {
     /** Clears any active interactive brush/lasso, selected point rings, and ego-graph arcs. */
     clearSelection(): void;
     /** Queries loaded tiles in workers for `row_id`s matching the active selection/filter. */
-    getSelectedRowIds(): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }>;
+    getSelectedRowIds(maxCount?: number): Promise<{
+        rowIds: number[];
+        rowIdsBigInt: bigint[];
+        totalMatched: number;
+        truncated: boolean;
+    }>;
     /** Replaces the static curved graph/kNN edge layer (`<= 100,000` instanced quadratic Bézier arcs). */
     setEdges(edges: ReadonlyArray<EdgeSpec>, style?: EdgeStyleOptions): void;
     /** Updates visual styling for static and ego-resolved graph arcs. */

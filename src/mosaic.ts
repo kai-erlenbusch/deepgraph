@@ -4,7 +4,7 @@ import {
     clausePoint,
     coordinator as defaultCoordinator,
 } from '@uwdata/mosaic-core';
-import { Query, asNode, verbatim } from '@uwdata/mosaic-sql';
+import { Query, asNode, sql, verbatim } from '@uwdata/mosaic-sql';
 import { simplifyRdpPolygon } from './core/FilterGpuResources.ts';
 import type {
     DeepgraphFilter,
@@ -127,6 +127,8 @@ function quoteSqlIdent(ident: string): string {
  * 2. An axis-aligned bounding-box `BETWEEN` guard for Parquet/table zonemap pushdown, and
  * 3. An exact division-free inline even-odd ray-cast test (zero DuckDB C++ extensions or UDFs).
  */
+const MAX_LASSO_COORD_ABS = 1e150; // Prevents DuckDB SIMD `DOUBLE` multiplication overflow (`< 1.79e308`)
+
 export function buildLassoDuckDbSql(
     xColumn: string,
     yColumn: string,
@@ -151,6 +153,18 @@ export function buildLassoDuckDbSql(
         if (vy < minY) minY = vy;
         if (vy > maxY) maxY = vy;
     }
+    if (
+        !Number.isFinite(minX) ||
+        !Number.isFinite(maxX) ||
+        !Number.isFinite(minY) ||
+        !Number.isFinite(maxY) ||
+        Math.abs(minX) > MAX_LASSO_COORD_ABS ||
+        Math.abs(maxX) > MAX_LASSO_COORD_ABS ||
+        Math.abs(minY) > MAX_LASSO_COORD_ABS ||
+        Math.abs(maxY) > MAX_LASSO_COORD_ABS
+    ) {
+        return 'FALSE';
+    }
 
     const edgeTerms: string[] = [];
     const n = verts.length;
@@ -160,8 +174,11 @@ export function buildLassoDuckDbSql(
         const dy = yj - yi;
         // Horizontal edges (`yi === yj`) can never satisfy `(yi > y) <> (yj > y)`; skipping them
         // precomputes `slope = (xj - xi) / (yj - yi)` in Float64 with zero runtime SQL divisions!
-        if (Math.abs(dy) < 1e-15) continue;
+        if (!Number.isFinite(dy) || Math.abs(dy) < 1e-15) continue;
         const slope = (xj - xi) / dy;
+        if (!Number.isFinite(slope) || Math.abs(slope) > MAX_LASSO_COORD_ABS) {
+            return 'FALSE';
+        }
         edgeTerms.push(
             `CASE WHEN ((${yi} > ${qy}) <> (${yj} > ${qy})) AND (${qx} < ((${qy} - ${yi}) * ${slope} + ${xi})) THEN 1 ELSE 0 END`
         );
@@ -216,15 +233,89 @@ function extractRowIdsFromQueryResult(
     if (typeof tbl.getChild === 'function') {
         const col = tbl.getChild(rowIdKey) ?? tbl.getChildAt?.(0);
         if (!col) return new Uint32Array(0);
-        if (Array.isArray(col.data) && col.data.length === 1 && col.data[0]?.values) {
-            const vals = col.data[0].values;
-            const len = Math.min(tbl.numRows ?? vals.length, col.data[0].length ?? vals.length);
-            if (vals instanceof Uint32Array) return vals.subarray(0, len);
-            if (vals instanceof BigUint64Array) return vals.subarray(0, len);
-            if (vals instanceof BigInt64Array) {
-                const u64 = new BigUint64Array(len);
-                for (let i = 0; i < len; i++) u64[i] = BigInt.asUintN(64, vals[i]);
-                return u64;
+        const chunks: any[] = Array.isArray(col.data) ? col.data : [];
+        if (chunks.length > 0) {
+            const allZeroNulls = chunks.every(
+                (ch) => ch?.values && (ch.nullCount === undefined || ch.nullCount === 0)
+            );
+            if (allZeroNulls) {
+                const totalLen = chunks.reduce(
+                    (acc, ch) => acc + Math.min(ch.length ?? ch.values.length, ch.values.length),
+                    0
+                );
+                if (chunks.length === 1) {
+                    const vals = chunks[0].values;
+                    const len = Math.min(tbl.numRows ?? totalLen, totalLen);
+                    if (vals instanceof Uint32Array) return vals.subarray(0, len);
+                    if (vals instanceof BigUint64Array) return vals.subarray(0, len);
+                    if (vals instanceof BigInt64Array) {
+                        return new BigUint64Array(vals.buffer, vals.byteOffset, len);
+                    }
+                }
+                const firstVals = chunks[0].values;
+                if (firstVals instanceof Uint32Array) {
+                    const outU32 = new Uint32Array(totalLen);
+                    let off = 0;
+                    for (const ch of chunks) {
+                        const len = Math.min(ch.length ?? ch.values.length, ch.values.length);
+                        outU32.set((ch.values as Uint32Array).subarray(0, len), off);
+                        off += len;
+                    }
+                    return outU32;
+                }
+                if (firstVals instanceof BigUint64Array || firstVals instanceof BigInt64Array) {
+                    const outU64 = new BigUint64Array(totalLen);
+                    let off = 0;
+                    for (const ch of chunks) {
+                        const raw = ch.values as BigUint64Array | BigInt64Array;
+                        const len = Math.min(ch.length ?? raw.length, raw.length);
+                        const view =
+                            raw instanceof BigUint64Array
+                                ? raw.subarray(0, len)
+                                : new BigUint64Array(raw.buffer, raw.byteOffset, len);
+                        outU64.set(view, off);
+                        off += len;
+                    }
+                    return outU64;
+                }
+                if (firstVals instanceof Int32Array) {
+                    let hasNeg = false;
+                    for (const ch of chunks) {
+                        const arr = ch.values as Int32Array;
+                        const len = Math.min(ch.length ?? arr.length, arr.length);
+                        for (let i = 0; i < len; i++) {
+                            if (arr[i] < 0) {
+                                hasNeg = true;
+                                break;
+                            }
+                        }
+                        if (hasNeg) break;
+                    }
+                    if (!hasNeg) {
+                        const outU32 = new Uint32Array(totalLen);
+                        let off = 0;
+                        for (const ch of chunks) {
+                            const arr = ch.values as Int32Array;
+                            const len = Math.min(ch.length ?? arr.length, arr.length);
+                            outU32.set(
+                                new Uint32Array(arr.buffer, arr.byteOffset, len),
+                                off
+                            );
+                            off += len;
+                        }
+                        return outU32;
+                    }
+                    const outU64 = new BigUint64Array(totalLen);
+                    let off = 0;
+                    for (const ch of chunks) {
+                        const arr = ch.values as Int32Array;
+                        const len = Math.min(ch.length ?? arr.length, arr.length);
+                        for (let i = 0; i < len; i++) {
+                            outU64[off++] = BigInt.asUintN(64, BigInt(arr[i]));
+                        }
+                    }
+                    return outU64;
+                }
             }
         }
         const n = Number(tbl.numRows ?? col.length ?? 0);
@@ -263,6 +354,8 @@ class DeepgraphMosaicClientImpl
     public sqlQueryCount = 0;
 
     private _latestEval: Promise<void> = Promise.resolve();
+    private evalSeq = 0;
+    private activeSqlQuerySeq = 0;
     private hasActiveSqlMask = false;
     private unsubBrush: (() => void) | null = null;
     private unsubSelect: (() => void) | null = null;
@@ -343,7 +436,7 @@ class DeepgraphMosaicClientImpl
     }
 
     public override queryResult(data: unknown): this {
-        if (this.destroyed) return this;
+        if (this.destroyed || this.activeSqlQuerySeq !== this.evalSeq) return this;
         const ids = extractRowIdsFromQueryResult(data, 'row_id');
         this.hasActiveSqlMask = true;
         this._latestEval = this.plot.setFilteredRowIds(ids);
@@ -630,6 +723,7 @@ class DeepgraphMosaicClientImpl
             return;
         }
 
+        const mySeq = ++this.evalSeq;
         const externalClauses = sel.clauses.filter(
             (c) => c.predicate !== null && c.predicate !== undefined && !this.isSelfClause(sel, c)
         );
@@ -691,10 +785,12 @@ class DeepgraphMosaicClientImpl
             return;
         }
 
+        const ridColNode = asNode(this.rowIdColumn);
         const q = Query.from(this.table)
-            .select({ row_id: asNode(this.rowIdColumn) })
-            .where(filterPred as any);
+            .select({ row_id: ridColNode })
+            .where(sql`${ridColNode} IS NOT NULL`, filterPred as any);
 
+        this.activeSqlQuerySeq = mySeq;
         this.lastExecutionPath = 'sql';
         this.sqlQueryCount++;
         await this.requestQuery(q);

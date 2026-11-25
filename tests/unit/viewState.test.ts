@@ -167,4 +167,27 @@ describe('ViewState — literal transform, spatial flipY, optical preservation &
         assert.deepEqual(capturedNext.color.domain, [0, 3600]);
         assert.equal(mockStore.colOrigins.unix_ts, 1_710_000_000.0);
     });
+
+    it('clears colorField and sizeField cleanly when encoding.color or encoding.size is null', () => {
+        const session = makeMockSession();
+        const vs = new ViewState();
+        vs.applyEncoding(
+            {
+                color: { field: 'bp_rp', scale: 'viridis' },
+                size: { field: 'cad_x' },
+            },
+            session.summary.stats,
+            session.summary.categories
+        );
+        assert.equal(vs.snapshot().colorField, 'bp_rp');
+        assert.equal(vs.snapshot().sizeField, 'cad_x');
+
+        vs.applyEncoding(
+            { color: null, size: null },
+            session.summary.stats,
+            session.summary.categories
+        );
+        assert.equal(vs.snapshot().colorField, '');
+        assert.equal(vs.snapshot().sizeField, '');
+    });
 });

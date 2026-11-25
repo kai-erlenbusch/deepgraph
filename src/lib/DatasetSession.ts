@@ -513,18 +513,29 @@ export class DatasetSession {
         return this.tileClient.setRowIdFilter(ids, probeRowIds);
     }
 
-    public queryLoadedSpatialSelection(spec: {
-        rect?: { minX: number; maxX: number; minY: number; maxY: number } | null;
-        lasso?: ReadonlyArray<readonly [number, number]> | null;
-        effectiveFlipY: boolean;
-    }): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }> {
-        return this.tileClient.queryLoadedSpatialSelection({
-            rect: spec.rect,
-            lasso: spec.lasso,
-            dataBounds: this.summary.dataBounds,
-            rootBounds: this.summary.rootBounds,
-            effectiveFlipY: spec.effectiveFlipY,
-        });
+    public queryLoadedSpatialSelection(
+        spec: {
+            rect?: { minX: number; maxX: number; minY: number; maxY: number } | null;
+            lasso?: ReadonlyArray<readonly [number, number]> | null;
+            effectiveFlipY: boolean;
+        },
+        maxCount?: number
+    ): Promise<{
+        rowIds: number[];
+        rowIdsBigInt: bigint[];
+        totalMatched: number;
+        truncated: boolean;
+    }> {
+        return this.tileClient.queryLoadedSpatialSelection(
+            {
+                rect: spec.rect,
+                lasso: spec.lasso,
+                dataBounds: this.summary.dataBounds,
+                rootBounds: this.summary.rootBounds,
+                effectiveFlipY: spec.effectiveFlipY,
+            },
+            maxCount
+        );
     }
 
     public releaseTileCpuBuffers(tile: TileData): void {

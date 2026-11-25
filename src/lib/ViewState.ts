@@ -13,7 +13,14 @@ function normalizeSpatialField(
     raw: string | null | undefined,
     defaultSpatial: 'x_u16' | 'y_u16'
 ): string | null {
-    if (raw === null || raw === undefined || raw === '' || raw === defaultSpatial) {
+    if (
+        raw === null ||
+        raw === undefined ||
+        raw === '' ||
+        raw === defaultSpatial ||
+        raw === '$spatial_x' ||
+        raw === '$spatial_y'
+    ) {
         return null;
     }
     return raw;
@@ -294,7 +301,11 @@ export class ViewState {
         }
 
         if (encoding.color !== undefined) {
-            if (typeof encoding.color === 'string') {
+            if (encoding.color === null) {
+                if (!emb?.colorField) {
+                    this.colorField = '';
+                }
+            } else if (typeof encoding.color === 'string') {
                 if (!emb?.colorField) {
                     this.colorField = encoding.color;
                     const st = stats?.[this.colorField];
@@ -337,7 +348,9 @@ export class ViewState {
             }
 
             const requestedScale =
-                typeof encoding.color === 'object' ? encoding.color.scale : undefined;
+                encoding.color !== null && typeof encoding.color === 'object'
+                    ? encoding.color.scale
+                    : undefined;
             const keepsOptical =
                 internalOpts?.preserveOpticalIfUnchanged ||
                 (this.colorField === this.opticalColorField && requestedScale === undefined);
@@ -354,7 +367,11 @@ export class ViewState {
         }
 
         if (encoding.size !== undefined) {
-            if (typeof encoding.size === 'string') {
+            if (encoding.size === null) {
+                if (!emb?.sizeField) {
+                    this.sizeField = '';
+                }
+            } else if (typeof encoding.size === 'string') {
                 if (!emb?.sizeField) {
                     this.sizeField = encoding.size;
                     const st = stats?.[this.sizeField];

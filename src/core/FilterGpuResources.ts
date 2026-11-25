@@ -121,10 +121,13 @@ export function simplifyRdpPolygon(
     points: ReadonlyArray<readonly [number, number]>,
     maxVertices = MAX_LASSO_GPU_VERTICES
 ): [number, number][] {
+    const nIn = points.length;
+    const strideLen = nIn > 16384 ? 16384 : nIn;
     const cleaned: [number, number][] = [];
-    for (let i = 0; i < points.length; i++) {
-        const x = Number(points[i][0]);
-        const y = Number(points[i][1]);
+    for (let k = 0; k < strideLen; k++) {
+        const idx = nIn > 16384 ? Math.floor((k * nIn) / 16384) : k;
+        const x = Number(points[idx][0]);
+        const y = Number(points[idx][1]);
         if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
         if (cleaned.length > 0) {
             const prev = cleaned[cleaned.length - 1];
@@ -142,49 +145,67 @@ export function simplifyRdpPolygon(
     if (cleaned.length <= maxVertices) {
         return cleaned;
     }
+    const cappedInput: [number, number][] =
+        cleaned.length > 4096
+            ? Array.from(
+                  { length: 4096 },
+                  (_, k) => cleaned[Math.floor((k * cleaned.length) / 4096)]
+              )
+            : cleaned;
 
     let minX = Infinity;
     let maxX = -Infinity;
     let minY = Infinity;
     let maxY = -Infinity;
-    for (const [x, y] of cleaned) {
+    for (const [x, y] of cappedInput) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
         if (y > maxY) maxY = y;
     }
-    const diagSq = Math.max(1e-24, (maxX - minX) ** 2 + (maxY - minY) ** 2);
+    const spanX = maxX - minX;
+    const spanY = maxY - minY;
+    const rawDiagSq = spanX * spanX + spanY * spanY;
 
-    // Close seam temporarily during RDP so start/end anchor preserves loop topology
-    const closedInput: [number, number][] = [...cleaned, [cleaned[0][0], cleaned[0][1]]];
-    let lo = 0.0;
-    let hi = diagSq * 0.25;
-    let best: [number, number][] | null = null;
+    if (Number.isFinite(rawDiagSq)) {
+        const diagSq = Math.max(1e-24, rawDiagSq);
+        // Close seam temporarily during RDP so start/end anchor preserves loop topology
+        const closedInput: [number, number][] = [
+            ...cappedInput,
+            [cappedInput[0][0], cappedInput[0][1]],
+        ];
+        let lo = 0.0;
+        let hi = diagSq * 0.25;
+        let best: [number, number][] | null = null;
 
-    for (let iter = 0; iter < 24; iter++) {
-        const mid = iter === 0 ? diagSq * 1e-8 : 0.5 * (lo + hi);
-        const cand = rdpPass(closedInput, mid);
-        const openCand = cand.length > 1 ? cand.slice(0, cand.length - 1) : cand;
-        if (openCand.length <= maxVertices) {
-            if (openCand.length >= 3) {
-                best = openCand;
+        for (let iter = 0; iter < 24; iter++) {
+            const mid = iter === 0 ? diagSq * 1e-8 : 0.5 * (lo + hi);
+            const cand = rdpPass(closedInput, mid);
+            const openCand = cand.length > 1 ? cand.slice(0, cand.length - 1) : cand;
+            if (openCand.length <= maxVertices) {
+                if (openCand.length >= 3) {
+                    best = openCand;
+                }
+                hi = mid;
+            } else {
+                lo = mid;
             }
-            hi = mid;
-        } else {
-            lo = mid;
+        }
+
+        if (best && best.length >= 3 && best.length <= maxVertices) {
+            return best;
         }
     }
 
-    if (best && best.length >= 3 && best.length <= maxVertices) {
-        return best;
-    }
-
-    // Deterministic uniform stride fallback if colinear/degenerate
+    // Deterministic uniform stride fallback if colinear/degenerate or extreme float span
     const fallback: [number, number][] = [];
     const target = Math.max(3, maxVertices);
     for (let k = 0; k < target; k++) {
-        const idx = Math.min(cleaned.length - 1, Math.floor((k * cleaned.length) / target));
-        fallback.push(cleaned[idx]);
+        const idx = Math.min(
+            cappedInput.length - 1,
+            Math.floor((k * cappedInput.length) / target)
+        );
+        fallback.push(cappedInput[idx]);
     }
     return fallback;
 }

@@ -36,5 +36,13 @@ test-results/
 .DS_Store
 
 # Python
+.venv/
 __pycache__/
 *.pyc
+*.egg-info/
+python/build/
+python/dist/
+python/*.egg-info/
+python/pydeepgraph/_static/widget.js
+python/LICENSE
+python/NOTICE

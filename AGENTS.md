@@ -6,7 +6,7 @@ Engineering context, architectural invariants, and verification commands for AI 
 
 ## 1. Repository Scope & Sibling Boundary
 
-- **This repository (`deepgraph`):** Pure-WebGPU billion-point and graph visualization library (`npm install deepgraph`) + standalone demo application.
+- **This repository (`deepgraph`):** Pure-WebGPU billion-point and graph visualization library (`npm install deepgraph`), optional Mosaic cross-filter adapter (`deepgraph/mosaic`), Python `anywidget` package (`python/` -> `pip install pydeepgraph`), and standalone demo application.
   - Target GitHub repository: `https://github.com/kai-erlenbusch/deepgraph`
 - **Sibling repository (`arrowtiles`):** Python + Rust (`PyO3`) `.arrowtiles` `v0.1` spatial pyramid builder, reference reader, validator, and wire-format specification (`docs/SPEC.md`).
   - Located locally at `../arrowtiles` (or `../duckdb-arrowtiles` prior to local folder rename).
@@ -28,13 +28,17 @@ Engineering context, architectural invariants, and verification commands for AI 
 ```text
 src/
 ├── index.ts                 # Public library entry (`export { Deepgraph }` + public TS types ONLY)
+├── mosaic.ts                # Optional `deepgraph/mosaic` Vega-Lite / Mosaic coordinator client
 ├── PMTilesClient.ts         # HTTP Range / File / CustomRangeSource PMTiles v3 client & worker pool
 ├── pmtiles.worker.ts        # Off-main-thread Zstd WASM (`@bokuweb/zstd-wasm`) + `@uwdata/flechette` worker
 ├── workerCodec.ts           # Pure Arrow IPC column/row extraction, 1D RTO & Zstd frame-header guard
 ├── core/
 │   ├── Renderer.ts          # Plain-WebGPU adapter/device/swapchain, Camera2D & pointer/wheel input
 │   ├── TileGpuStore.ts      # Bounded LRU GPU storage-buffer slots + Float64 RTC coordinate uniforms
-│   ├── ComputeRasterizer.ts # Commutative 2×u32 atomic WGSL compute rasterizer + per-pixel resolve
+│   ├── ComputeRasterizer.ts # Commutative 2×u32 atomic WGSL compute rasterizer + 2-subpass context dimming
+│   ├── FilterGpuResources.ts# GPU brush/64-vertex lasso uniforms & 32 KiB per-slot `row_id` bitmasks
+│   ├── SelectionOverlay.ts  # Plain-WebGPU interactive 2D brush & freehand lasso overlay
+│   ├── EdgeOverlay.ts       # Instanced quadratic Bézier graph & 1-hop ego-arc WebGPU pass
 │   ├── PickingLayer.ts      # 9×9 CSS px GPU compute hit-testing (<= 8 storage buffers/stage)
 │   └── HighlightOverlay.ts  # Plain-WebGPU hover & selection ring pass
 ├── lib/
@@ -44,8 +48,14 @@ src/
 │   ├── RenderLoop.ts        # rAF frame loop & library-owned GPU/CPU byte telemetry
 │   ├── diagnostics.ts       # `@internal` symbol hook for Playwright tests (stripped from `.d.ts`)
 │   └── types.ts             # Public TypeScript interfaces
+├── widget/
+│   └── widget_entry.ts      # Self-contained `anywidget` ESM entry bundled into `pydeepgraph/_static/widget.js`
 ├── demo/                    # Demo-only UI (`ControlsPanel.ts`, `gaiaPreset.ts`, `gpuStats.ts`)
 └── main.ts                  # Demo app entry (`index.html`), uses ONLY public `src/index.ts` API
+python/
+├── pydeepgraph/             # `pydeepgraph` Python package (`widget.py`, `_http_range.py`, `_ingest.py`, `_edges.py`)
+├── examples/                # Reactive Marimo showcases (`marimo_lmsys_mosaic.py`, `marimo_gaia_1_35b.py`)
+└── tests/                   # `pytest` protocol, ingest, HTTP 206 & RDP lasso parity tests
 ```
 
 ### Mandatory Library Boundaries
@@ -73,16 +83,19 @@ src/
 
 ```bash
 npm run typecheck        # Strict TypeScript check (`tsc --noEmit` + `tsconfig.unit.json`)
-npm run build:lib        # Build `dist/index.js`, single-file `dist/standalone.js`, worker & `.d.ts`
+npm run build:lib        # Build `dist/index.js`, `dist/standalone.js`, `dist/mosaic.js`, worker & `.d.ts`
+npm run build:widget     # Build self-contained `python/pydeepgraph/_static/widget.js` & sync license files
 npm run verify:types     # External `tsc` (`bundler` + `nodenext`) + real downstream `vite build`
-npm run test:unit        # Node.js (`node:test`) worker IPC codec & ViewState unit tests
+npm run test:unit        # Node.js (`node:test`) worker IPC codec, filter/Mosaic & ViewState unit tests
 npm run build:demo       # Build standalone demo app into `dist-demo/`
-npm run test:e2e         # Fast Playwright E2E suite (< 5 MiB samples in `../arrowtiles/samples/`)
+npm run test:e2e         # Fast Playwright E2E suite (< 5 MiB samples + live Marimo WebGPU spec)
 npm run test:e2e:heavy   # Heavy 5-gate VRAM/LRU suite (requires local `public/gaia_full.arrowtiles` + `25k` sample)
 ```
 
 - **Sample Archives for Local `test:e2e`:** Vite's range server (`vite.config.ts`) resolves `/samples/*.arrowtiles` from `../arrowtiles/samples/` (falling back to `../duckdb-arrowtiles/samples/`). Generate them from the sibling `arrowtiles` repo via `python scripts/build_samples.py` if missing.
 - **Discrete GPU Coexistence:** Playwright uses `--force_low_power_gpu` (`playwright.config.ts`) and `powerPreference: 'low-power'` so automated browser tests run on the integrated GPU without contending with discrete CUDA/ML workloads.
+- **Prove-It-Works Runtime Gate:** Static checks (`tsc`, `marimo check`, `pytest` mocks) are never sufficient on their own for WebGPU shaders, `ViewState` transitions, or `anywidget` UI paths; verify every rendering, picking, or widget behavior live in Playwright (`npm run test:e2e`) on real `.arrowtiles` fixtures before sign-off.
+- **Zero-Context Goldfish Pre-Release Audit:** Prior to cutting release tags (`v*` / `pydeepgraph-v*`), run an isolated fresh-context `research` subagent review over `git diff` against `AGENTS.md` invariants and untrusted-input boundaries.
 - **Release Gate:** Do **not** run `git push` or `npm publish` unless explicitly instructed by the repository owner.
 
 ---

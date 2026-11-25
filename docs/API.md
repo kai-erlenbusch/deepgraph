@@ -91,10 +91,12 @@ interface DeepgraphOptions {
   powerPreference?: 'high-performance' | 'low-power';
   /** Initial canvas left-drag mode (`'pan'` default, `'brush'` 2D box/spotlight lens, or `'lasso'` freehand polygon). */
   interactionMode?: 'pan' | 'brush' | 'lasso';
-  /** Temporary drag mode activated when holding `Shift` while left-dragging (`'brush'` default). */
-  shiftDragMode?: 'brush' | 'lasso';
+  /** Temporary drag mode activated when holding `Shift` while left-dragging (`'brush'` default, `'lasso'`, or `'none'`). */
+  shiftDragMode?: 'brush' | 'lasso' | 'none';
   /** Eagerly retain per-tile `(row_id, x_u16, y_u16)` indexes in Web Workers for `getSelectedRowIds()` (`false` default; enabled automatically on `setFilteredRowIds`). */
   enableRowIdIndex?: boolean;
+  /** Optional cap on `rowIds` / `rowIdsBigInt` materialized per committed brush/lasso (`undefined` = unlimited; `0` skips loaded-tile `row_id` extraction). */
+  maxSelectedRowIds?: number;
   /** Initial zero-SQL GPU cross-filter (`rect`, `lasso`, `ranges`, `categories`, `unselectedOpacity`). */
   filter?: DeepgraphFilter | null;
   /** Initial static curved quadratic Bézier graph/kNN arcs (`<= 100,000`). */
@@ -158,13 +160,13 @@ interface DeepgraphEncoding {
     domain?: [number, number];
     range?: [number, number];
   };
-  color?: string | {
+  color?: string | null | {
     field: string;
-    scale?: ColorScaleName;
+    scale?: ColorScaleName | ExperimentalColorScaleName;
     domain?: [number, number];
     invert?: boolean;
   };
-  size?: string | {
+  size?: string | null | {
     field: string;
     domain?: [number, number];
     range?: [number, number];
@@ -211,7 +213,7 @@ interface DeepgraphEncoding {
 | **`canApplyFilterOnGpu`** | `canApplyFilterOnGpu(filter: DeepgraphFilter \| null): boolean` | Returns `true` when `filter` fits completely within the GPU uniform fast path (`<= 6` GPU-resident range slots including up to `2` idle spatial slots, and `<= 2` categorical columns with `< 512` codes). |
 | **`setFilteredRowIds`** | `setFilteredRowIds(ids: Iterable<number \| bigint \| string> \| Uint32Array \| BigUint64Array \| null): Promise<void>` | Compiles per-slot `32 KiB` (`262,144`-bit, `vec4<u32>`-aligned) `@binding(11)` visibility bitmasks in Web Workers (`0` main-thread $O(N)$ loops; lazily allocated and `.destroy()`ed when cleared). |
 | **`clearSelection`** | `clearSelection(): void` | Clears any active interactive `rect`/`lasso` selection, selected point rings, and click-pinned ego-graph arcs. |
-| **`getSelectedRowIds`** | `getSelectedRowIds(): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[] }>` | Queries loaded visible spatial tiles in Web Workers (intersected with any active `setFilteredRowIds` bitmask) for `row_id`s matching the active spatial brush/lasso or clicked point. On non-spatial chart axes (or to query all `N` rows including unloaded deep tiles), evaluate `PointSelectEvent.clause` in DuckDB/Mosaic. |
+| **`getSelectedRowIds`** | `getSelectedRowIds(maxCount?: number): Promise<{ rowIds: number[]; rowIdsBigInt: bigint[]; totalMatched: number; truncated: boolean }>` | Queries loaded visible spatial tiles in Web Workers (intersected with any active `setFilteredRowIds` bitmask, capped to `maxCount` / `options.maxSelectedRowIds` without main-thread `Set<bigint>` allocation) for `row_id`s matching the active spatial brush/lasso or clicked point. On non-spatial chart axes (or to query all `N` rows including unloaded deep tiles), evaluate `PointSelectEvent.clause` in DuckDB/Mosaic. |
 | **`setEdges` / `setEdgeStyle`** | `setEdges(edges: ReadonlyArray<EdgeSpec>, style?: EdgeStyleOptions): void` | Renders up to `100,000` anti-aliased curved quadratic Bézier graph/kNN arcs via `EdgeOverlay` (`0` storage buffers, `Float64` RTC uniforms, complementary `A→B` / `B→A` curvature, and 2-second axis transitions). |
 | **`on` / `off`** | `on(event, handler): () => void` / `off(event, handler): void` | Subscribes or unsubscribes from typed events (`click`, `hover`, `select`, `brush`, `telemetry`, `load`, `error`). `on(...)` returns an unsubscribe function. |
 | **`destroy`** | `destroy(): void` | Cancels any in-flight `load()`, terminates Web Workers, destroys all `TileGpuStore`, `ComputeRasterizer`, `FilterGpuResources`, `PickingLayer`, `EdgeOverlay`, `SelectionOverlay`, and `HighlightOverlay` `GPUBuffer`s, unconfigures the WebGPU swapchain context, calls `device.destroy()`, removes `ResizeObserver` & pointer/wheel listeners, and removes `<canvas>` from `container`. |
@@ -227,7 +229,7 @@ interface DeepgraphEncoding {
 | `'error'` | `Error` | Fired on uncaptured WebGPU device errors, point-decode / `resolveRowAttributes` exceptions, or fatal render-loop errors. |
 | `'click'` | `PointHitEvent \| null` | Triggered on `< 4 CSS px` pointer clicks via the `9×9 CSS px` GPU `PickingLayer`, returning `{ rowId: number, rowIdBigInt?: bigint, screenX, screenY, dataX, dataY, attributes }` decoded directly from `.arrowtiles` (plus optional `resolveRowAttributes`), or `null` on empty space. |
 | `'hover'` | `PointHitEvent \| null` | Throttled (`45 ms`), single-in-flight pointer-hover hit event (dispatched only when at least one `'hover'` listener is attached). Renders the cyan hover ring immediately from GPU winner coordinates (`0 ms` network wait), deduplicates repeated hovers over the same point, reuses a byte-capped (`<= 8` tiles / `<= 24 MiB`) compressed-tile LRU + 1-tile worker Arrow `Table` cache (`O(1)` consecutive intra-tile lookups), cancels stale decodes via `AbortSignal`, and clears automatically (`hover: null`) on `pointerleave`. |
-| `'select'` | `PointSelectEvent` | Emitted on committed point click, `pointerup` after `'brush'`/`'lasso'` drag, or brush clear (`{ points, clause?: SelectionGeometryClause, rowIds?, rowIdsBigInt? }`). |
+| `'select'` | `PointSelectEvent` | Emitted on committed point click, `pointerup` after `'brush'`/`'lasso'` drag, or brush clear (`{ points, clause?: SelectionGeometryClause, rowIds?, rowIdsBigInt?, totalMatched?, rowIdsTruncated? }`). |
 | `'brush'` | `SelectionGeometryClause` | Throttled (`16 ms`) live selection geometry (`kind: 'rect' \| 'lasso' \| 'none'`, `xField`, `yField`, `rect`, `lasso`) emitted during interactive drag. |
 
 ---
@@ -304,7 +306,7 @@ const skySurveyPreset: DeepgraphPreset = {
 | `npm run verify:types` | Runs external consumer `tsc --noEmit` under both `"moduleResolution": "bundler"` and `"moduleResolution": "nodenext"` (`allowImportingTsExtensions` disabled, `skipLibCheck: false`, `types: []`, testing `"."`, `"./standalone"`, and `"./mosaic"` without requiring `@uwdata/mosaic-*` installed) **plus** a real `vite build` consumer application. |
 | `npm run test:unit` | Runs fast Node.js (`node:test`) unit tests covering `@uwdata/flechette` worker IPC codecs (`Utf8View`, `Decimal128`, `Timestamp`, `Date32`, `Float16`, `Dictionary`, `BigInt > 2^53-1`, `1D RTO` `colOrigins`, Zstd bomb rejection), `ViewState`, Ramer–Douglas–Peucker lasso simplification, `32 KiB` `u32`/`u64` bitmask slicing, and `DeepgraphMosaicClient` Path A/Path B + division-free DuckDB SQL. |
 | `npm run build:demo` | Builds the standalone interactive `lil-gui` demo application into `dist-demo/` (`copyPublicDir: false`). |
-| `npm run test:e2e` | Runs the 5 fast Playwright WebGPU specs (`library-embed`, `phase8b-hdr-density`, `picking-layer`, `brush-mosaic`, `ego-edges`) on Intel iGPU against `< 5 MiB` sample archives in sibling `../arrowtiles/samples/`. |
+| `npm run test:e2e` | Runs the 6 fast Playwright WebGPU specs (`library-embed`, `phase8b-hdr-density`, `picking-layer`, `brush-mosaic`, `ego-edges`, `marimo-anywidget`) on Intel iGPU against `< 5 MiB` sample archives in sibling `../arrowtiles/samples/`. |
 | `npm run test:e2e:heavy` | Runs the 5-gate VRAM & LRU lifecycle stress suite (`gpu-vram-lifecycle.spec.ts`) against local `public/gaia_full.arrowtiles` (or `DEEPGRAPH_GAIA_FILE`) and `../arrowtiles/samples/lmsys_d7_proportional_25k.arrowtiles`. |
 
 ### Bundled vs. Externalized Dependencies & Zero-Config Worker / WASM Loading

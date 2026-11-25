@@ -1,0 +1,5 @@
+include LICENSE
+include NOTICE
+include README.md
+recursive-include pydeepgraph/_static *.js
+include pydeepgraph/py.typed

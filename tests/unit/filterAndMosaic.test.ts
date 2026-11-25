@@ -465,6 +465,29 @@ describe('deepgraph/mosaic — Division-Free DuckDB Lasso SQL & Real UW Mosaic C
         assert.ok(starSql.includes(`"x" BETWEEN ${minX} AND ${maxX}`));
         const caseCount = (starSql.match(/CASE WHEN/g) ?? []).length;
         assert.equal(caseCount, nonHorizEdges);
+
+        // Extreme coordinates exceeding `1e150` return `'FALSE'` so DuckDB SIMD `DOUBLE` multiplication never overflows
+        assert.equal(
+            buildLassoDuckDbSql('x', 'y', [
+                [-1e250, -1e200],
+                [1e250, 0],
+                [0, 1e200],
+            ]),
+            'FALSE'
+        );
+
+        // 20,000-vertex polygon (> 16,384 pre-decimation cap) simplifies cleanly to <= 64 vertices
+        const hugePoly: [number, number][] = Array.from({ length: 20000 }, (_, k) => {
+            const ang = (k / 20000) * Math.PI * 2;
+            const rad = (k % 2 === 0 ? 1.0 : 0.6) * 1e120;
+            return [Math.cos(ang) * rad, Math.sin(ang) * rad];
+        });
+        const simpHuge = simplifyRdpPolygon(hugePoly, 64);
+        assert.ok(simpHuge.length >= 3 && simpHuge.length <= 64);
+        const hugeSql = buildLassoDuckDbSql('x', 'y', hugePoly, 64);
+        assert.ok(hugeSql.includes('BETWEEN'));
+        assert.equal(hugeSql.includes('Infinity'), false);
+        assert.equal(hugeSql.includes('NaN'), false);
     });
 
     it('integrates with real @uwdata/mosaic-core Coordinator: Path A (0 SQL), self-skip crossfilter, and Path B (SELECT row_id)', async () => {
@@ -643,6 +666,7 @@ describe('deepgraph/mosaic — Division-Free DuckDB Lasso SQL & Real UW Mosaic C
         assert.equal(dgClient.sqlQueryCount, 1);
         assert.equal(rowIdQueries().length, 1);
         assert.ok(rowIdQueries()[0].includes('SELECT "row_id"'));
+        assert.ok(rowIdQueries()[0].includes('IS NOT NULL'));
         assert.ok(rowIdQueries()[0].includes('"lmsys_umap"'));
         assert.deepEqual(state.lastRowIds, [40064n, 9_007_199_254_740_995n]);
 
@@ -656,6 +680,10 @@ describe('deepgraph/mosaic — Division-Free DuckDB Lasso SQL & Real UW Mosaic C
         assert.equal(dgClient.lastExecutionPath, 'gpu');
         assert.equal(state.lastRowIds, null);
         assert.deepEqual(state.currentFilter?.ranges?.num_of_tokens, [120, 380]);
+
+        // Late/stale `queryResult` from an earlier superseded Path B query is dropped by `evalSeq`
+        (dgClient as any).queryResult(rowIdIpcBytes);
+        assert.equal(state.lastRowIds, null);
 
         dgClient.destroy();
         mc.disconnect(peer);
